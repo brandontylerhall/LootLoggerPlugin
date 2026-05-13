@@ -3,15 +3,16 @@ package com.lootlogger;
 import com.google.inject.Provides;
 import com.lootlogger.data.*;
 import com.lootlogger.io.LootWriter;
-
 import com.lootlogger.util.InventoryProcessor;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.*;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.AnimationChanged;
 import net.runelite.api.events.CommandExecuted;
+import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.ItemContainerChanged;
 import net.runelite.api.events.MenuOptionClicked;
+import net.runelite.api.events.StatChanged;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.game.ItemManager;
@@ -23,7 +24,9 @@ import net.runelite.client.util.Text;
 
 import javax.inject.Inject;
 import java.time.temporal.ChronoUnit;
+import java.util.EnumMap;
 import java.util.List;
+import java.util.Map;
 
 @Slf4j
 @PluginDescriptor(name = "Loot to JSON")
@@ -45,35 +48,36 @@ public class LootLoggerPlugin extends Plugin {
     @Inject
     private java.util.concurrent.ScheduledExecutorService executor;
 
+    private static final Map<Integer, String> SKILL_MAP = Map.ofEntries(
+            Map.entry(879, "Woodcutting"),
+            Map.entry(877, "Woodcutting"),
+            Map.entry(875, "Woodcutting"),
+            Map.entry(625, "Mining"),
+            Map.entry(626, "Mining"),
+            Map.entry(627, "Mining"),
+            Map.entry(6756, "Mining"),
+            Map.entry(6752, "Mining"),
+            Map.entry(621, "Fishing")
+    );
+
     private String sessionId;
     private LootWriter lootWriter;
 
-    // DEBUG VARIABLES //
     private int lastActiveAnimation = -1;
     private String lastMenuOptionClicked = "";
     private String lastMenuTargetClicked = "";
+    private String lockedSkillingTarget = "Unknown";
+    private String lockedCombatTarget = "Unknown";
+    private String lockedMagicSpell = ""; // NEW: Explicitly track the spell cast
     private Item[] previousInventory = new Item[28];
 
+    private final Map<Skill, Integer> previousXpMap = new EnumMap<>(Skill.class);
+
     public void gameMsg(String msg) {
-        if (!config.showChatMessages()) {
-            return;
-        }
+        if (!config.showChatMessages()) return;
         client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", msg, null);
     }
 
-    private static final java.util.Map<Integer, String> SOURCE_MAP = java.util.Map.ofEntries(
-            java.util.Map.entry(879, "Woodcutting"), // Bronze axe
-            java.util.Map.entry(877, "Woodcutting"), // Iron axe
-            java.util.Map.entry(875, "Woodcutting"), // Steel axe
-            java.util.Map.entry(625, "Mining"),      // Bronze pick
-            java.util.Map.entry(626, "Mining"),      // Iron pick
-            java.util.Map.entry(627, "Mining"),      // Steel pick
-            java.util.Map.entry(621, "Small Net Fishing")
-    );
-
-    // =========================
-    //    START UP / SHUT DOWN
-    // =========================
     @Override
     protected void startUp() throws Exception {
         sessionId = java.util.UUID.randomUUID().toString();
@@ -83,6 +87,12 @@ public class LootLoggerPlugin extends Plugin {
         for (int i = 0; i < 28; i++) {
             previousInventory[i] = new Item(-1, 0);
         }
+
+        previousXpMap.clear();
+
+        if (client.getGameState() == GameState.LOGGED_IN) {
+            seedXpMap();
+        }
     }
 
     @Override
@@ -91,6 +101,7 @@ public class LootLoggerPlugin extends Plugin {
             lootWriter.flush();
             lootWriter.close();
         }
+        previousXpMap.clear();
     }
 
     @Schedule(period = 10, unit = ChronoUnit.SECONDS, asynchronous = true)
@@ -100,30 +111,29 @@ public class LootLoggerPlugin extends Plugin {
         }
     }
 
-    // =========================
-    //      DEBUG COMMAND
-    // =========================
-    @Subscribe
-    public void onCommandExecuted(CommandExecuted event) {
-        if (event.getCommand().equals("status")) {
-            int currentAnim = client.getLocalPlayer().getAnimation();
-            WorldPoint wp = client.getLocalPlayer().getWorldLocation();
-
-            gameMsg("--- DEBUG STATUS ---");
-            gameMsg(String.format("Current Animation: %d", currentAnim));
-            gameMsg(String.format("Last Saved Animation: %d", lastActiveAnimation));
-            gameMsg(String.format("Location: %d, %d, %d", wp.getX(), wp.getY(), wp.getPlane()));
-            gameMsg(String.format("Last menu option: %s", lastMenuOptionClicked));
+    private void seedXpMap() {
+        for (Skill skill : Skill.values()) {
+            previousXpMap.put(skill, client.getSkillExperience(skill));
         }
     }
 
-    // =========================
-    //      NPC LOOT EVENT
-    // =========================
+    @Subscribe
+    public void onGameStateChanged(GameStateChanged event) {
+        if (event.getGameState() == GameState.LOGGED_IN) {
+            seedXpMap();
+        }
+    }
+
+    @Subscribe
+    public void onCommandExecuted(CommandExecuted event) {
+        if (event.getCommand().equals("status")) {
+            gameMsg("Status printed to console/logs.");
+        }
+    }
+
     @Subscribe
     public void onNpcLootReceived(NpcLootReceived event) {
         NPC npc = event.getNpc();
-        String sourceName = npc.getName();
         WorldPoint wp = npc.getWorldLocation();
 
         List<DroppedItem> items = event.getItems().stream()
@@ -134,7 +144,7 @@ public class LootLoggerPlugin extends Plugin {
                 .sessionId(sessionId)
                 .eventType("NPC_DROP")
                 .category("Combat")
-                .source(sourceName)
+                .source(npc.getName())
                 .x(wp.getX())
                 .y(wp.getY())
                 .plane(wp.getPlane())
@@ -145,32 +155,101 @@ public class LootLoggerPlugin extends Plugin {
         executor.execute(() -> lootWriter.queueRecord(record));
     }
 
-    // =========================
-    //    ANIMATION & MENU EVENTS
-    // =========================
     @Subscribe
     public void onAnimationChanged(AnimationChanged event) {
         if (event.getActor() != client.getLocalPlayer()) return;
         int animId = client.getLocalPlayer().getAnimation();
-        if (animId != -1) {
-            lastActiveAnimation = animId;
+        if (animId != -1) lastActiveAnimation = animId;
+    }
+
+    @Subscribe
+    public void onStatChanged(StatChanged event) {
+        Skill skill = event.getSkill();
+        int currentXp = event.getXp();
+
+        if (!previousXpMap.containsKey(skill) || previousXpMap.get(skill) == 0) {
+            previousXpMap.put(skill, currentXp);
+            return;
         }
 
-        if (config.debugMessages()) {
-            gameMsg(String.format("Last animation ID: %d", lastActiveAnimation));
-            gameMsg(String.format("Current animation ID: %d", client.getLocalPlayer().getAnimation()));
+        int previousXp = previousXpMap.get(skill);
+        int xpDelta = currentXp - previousXp;
+        previousXpMap.put(skill, currentXp);
+
+        if (xpDelta <= 0) return;
+
+        boolean isCombatSkill = skill == Skill.ATTACK || skill == Skill.STRENGTH ||
+                skill == Skill.DEFENCE || skill == Skill.RANGED ||
+                skill == Skill.MAGIC || skill == Skill.HITPOINTS;
+
+        String category = isCombatSkill ? "Combat" : "Skilling";
+        String targetSource = isCombatSkill ? lockedCombatTarget : lockedSkillingTarget;
+
+        // NEW: If Magic XP, set the source to the spell cast (e.g., "Fire Strike")
+        if (skill == Skill.MAGIC && !lockedMagicSpell.isEmpty()) {
+            targetSource = lockedMagicSpell;
+        } else if (targetSource != null && targetSource.contains("->")) {
+            String[] parts = targetSource.split("->");
+            targetSource = parts[parts.length - 1].trim();
         }
+
+        Player localPlayer = client.getLocalPlayer();
+        int x = 0, y = 0, plane = 0, regionId = 0;
+        if (localPlayer != null) {
+            WorldPoint wp = localPlayer.getWorldLocation();
+            x = wp.getX();
+            y = wp.getY();
+            plane = wp.getPlane();
+            regionId = wp.getRegionID();
+        }
+
+        GameEvent record = GameEvent.builder()
+                .sessionId(sessionId)
+                .eventType("XP_GAIN")
+                .category(category)
+                .source(targetSource != null && !targetSource.isEmpty() ? targetSource : "Activity")
+                .skill(skill.getName())
+                .xpGained(xpDelta)
+                .x(x)
+                .y(y)
+                .plane(plane)
+                .regionId(regionId)
+                .build();
+
+        executor.execute(() -> lootWriter.queueRecord(record));
     }
 
     @Subscribe
     public void onMenuOptionClicked(MenuOptionClicked event) {
         lastMenuOptionClicked = event.getMenuOption();
-        lastMenuTargetClicked = Text.removeTags(event.getMenuTarget()); // Strips color codes
+        String rawTarget = Text.removeTags(event.getMenuTarget());
+        lastMenuTargetClicked = rawTarget.replaceAll("\\s*\\(level-\\d+\\)", "").trim();
+
+        String opt = lastMenuOptionClicked.toLowerCase();
+
+        if (opt.contains("mine") || opt.contains("chop") || opt.contains("cut") ||
+                opt.contains("net") || opt.contains("lure") || opt.contains("bait") ||
+                opt.contains("cage") || opt.contains("harpoon") || opt.contains("fish")) {
+            lockedSkillingTarget = lastMenuTargetClicked;
+        }
+        // NEW: Break "Cast Spell -> Enemy" into two separate fields
+        else if (opt.contains("cast")) {
+            if (lastMenuTargetClicked.contains("->")) {
+                String[] parts = lastMenuTargetClicked.split("->");
+                lockedMagicSpell = parts[0].trim();
+                lockedCombatTarget = parts[1].trim();
+            } else {
+                lockedMagicSpell = lastMenuTargetClicked.trim();
+                lockedCombatTarget = "None"; // It was a teleport or self-cast
+            }
+        }
+        // Track melee/ranged targets and clear the spell cache
+        else if (opt.contains("attack")) {
+            lockedCombatTarget = lastMenuTargetClicked;
+            lockedMagicSpell = "";
+        }
     }
 
-    // =========================
-    //    INVENTORY PROCESSING
-    // =========================
     @Subscribe
     public void onItemContainerChanged(ItemContainerChanged event) {
         WorldPoint wp = client.getLocalPlayer().getWorldLocation();
@@ -181,46 +260,34 @@ public class LootLoggerPlugin extends Plugin {
         boolean isBanking = (bankContainer != null);
         Item[] currentInventory = event.getItemContainer().getItems();
 
-        // 1. Build the State Package
         PlayerState state = PlayerState.builder()
                 .isBanking(isBanking)
                 .menuOption(lastMenuOptionClicked)
                 .menuTarget(lastMenuTargetClicked)
                 .currentAnim(client.getLocalPlayer().getAnimation())
                 .lastAnim(lastActiveAnimation)
-                .justCastSpell(false)   // Ready to be hooked up later
-                .justFiredRanged(false) // Ready to be hooked up later
-                .combatTarget("None")   // Ready to be hooked up later
+                .justCastSpell(false)
+                .justFiredRanged(false)
+                .combatTarget(lockedCombatTarget)
                 .build();
 
-        // 2. Process with the State Package
         List<InventoryEvent> events = InventoryProcessor.invProcess(previousInventory, currentInventory, state, itemManager);
 
-        // 3. Translate to GameEvents
         for (InventoryEvent invEvent : events) {
             int itemId = invEvent.itemId;
             int qty = invEvent.qty;
             String name = itemManager.getItemComposition(itemId).getName();
 
-            if (invEvent.actionType == ActionType.EQUIP) {
-                gameMsg(String.format("Equipped: %s", itemManager.getItemComposition(itemId).getName()));
-                continue;
-            }
-
-            if (invEvent.actionType == ActionType.UNEQUIP) {
-                gameMsg(String.format("Unequipped: %s", itemManager.getItemComposition(itemId).getName()));
-                continue;
-            }
-
             String category = "Misc";
             String sourceName = "None";
             String eventTypeStr = invEvent.actionType.name();
+            String skillName = null;
 
-            // Map the ActionType to your Frontend's UI Categories
             switch (invEvent.actionType) {
                 case GATHER_GAIN:
                     category = "Skilling";
-                    sourceName = (lastActiveAnimation != -1) ? SOURCE_MAP.getOrDefault(lastActiveAnimation, invEvent.targetName) : invEvent.targetName;
+                    skillName = SKILL_MAP.getOrDefault(lastActiveAnimation, "Unknown");
+                    sourceName = (lockedSkillingTarget != null && !lockedSkillingTarget.isEmpty()) ? lockedSkillingTarget : "Unknown Source";
                     break;
                 case SKILLING_CONSUME:
                     category = "Skilling";
@@ -248,11 +315,6 @@ public class LootLoggerPlugin extends Plugin {
                     break;
             }
 
-            // Only log Consumes/Drops if your config allows it
-            if ((invEvent.actionType == ActionType.CONSUME || invEvent.actionType == ActionType.DROP) && !config.logConsumables()) {
-                continue;
-            }
-
             List<DroppedItem> eventItems = List.of(new DroppedItem(itemId, name, qty, (itemManager.getItemPrice(itemId) * qty), itemManager.getItemComposition(itemId).getHaPrice() * qty));
 
             GameEvent record = GameEvent.builder()
@@ -261,6 +323,7 @@ public class LootLoggerPlugin extends Plugin {
                     .category(category)
                     .source(sourceName)
                     .target(invEvent.targetName)
+                    .skill(skillName)
                     .x(wp.getX())
                     .y(wp.getY())
                     .plane(wp.getPlane())
@@ -270,7 +333,6 @@ public class LootLoggerPlugin extends Plugin {
 
             executor.execute(() -> lootWriter.queueRecord(record));
         }
-
         previousInventory = currentInventory.clone();
     }
 }
