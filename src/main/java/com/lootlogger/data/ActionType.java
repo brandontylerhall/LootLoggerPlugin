@@ -2,15 +2,16 @@ package com.lootlogger.data;
 
 public enum ActionType {
     DESTROY,
+    DROP,
     CONSUME,
+    SKILLING_CONSUME,
+    COMBAT_CONSUME,
     GATHER_GAIN,
     BANK_DEPOSIT,
     BANK_WITHDRAWAL,
-    SWAP,
-    TAKE,
-    DROP,
-    RANGED_FIRE,
     SPELL_CAST,
-    COMBAT_CONSUME,
-    SKILLING_CONSUME
+    RANGED_FIRE,
+    TAKE,
+    EQUIP,
+    UNEQUIP
 }

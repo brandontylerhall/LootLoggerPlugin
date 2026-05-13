@@ -2,6 +2,7 @@ package com.lootlogger.util;
 
 import com.lootlogger.data.ActionType;
 import com.lootlogger.data.InventoryEvent;
+import com.lootlogger.data.PlayerState;
 import net.runelite.api.Item;
 import net.runelite.client.game.ItemManager;
 
@@ -18,17 +19,15 @@ public class InventoryProcessor {
     private static final java.util.Set<String> DESTROY_OPTIONS = java.util.Set.of("Destroy");
     private static final java.util.Set<Integer> FIREMAKE_OPTIONS = java.util.Set.of(733, 10572);
 
+    // NEW: Options that trigger an equip action
+    private static final java.util.Set<String> EQUIP_OPTIONS = java.util.Set.of(
+            "Wield", "Wear", "Equip"
+    );
+
     public static List<InventoryEvent> invProcess(
             Item[] previousInventory,
             Item[] currentInventory,
-            boolean isBanking,
-            String lastMenuOptionClicked,
-            String lastMenuTargetClicked,
-            int currentAnimation,
-            int lastAnimation,
-            boolean justCastSpell,
-            boolean justFiredRanged,
-            String combatTarget,
+            PlayerState state,
             ItemManager itemManager
     ) {
         List<InventoryEvent> events = new ArrayList<>();
@@ -49,16 +48,19 @@ public class InventoryProcessor {
 
                 boolean isRune = itemNameLower.contains("rune");
                 boolean isAmmo = itemNameLower.matches("(?i).*\\b(arrow|arrows|bolt|bolts|dart|darts|javelin|javelins)\\b.*");
-                boolean inCombat = !combatTarget.equals("None");
+                boolean inCombat = !state.getCombatTarget().equals("None");
 
-                if (isBanking) {
+                if (state.isBanking()) {
                     events.add(new InventoryEvent(itemId, qtyLost, ActionType.BANK_DEPOSIT, "Bank"));
                 }
-                else if (DESTROY_OPTIONS.contains(lastMenuOptionClicked)) {
+                else if (DESTROY_OPTIONS.contains(state.getMenuOption())) {
                     events.add(new InventoryEvent(itemId, qtyLost, ActionType.DESTROY, "None"));
                 }
-                else if ("Drop".equals(lastMenuOptionClicked)) {
-                    // Strong cooking detection for raw ingredients
+                // NEW: Catch Equips before they fall to the DROP catch-all
+                else if (EQUIP_OPTIONS.contains(state.getMenuOption())) {
+                    events.add(new InventoryEvent(itemId, qtyLost, ActionType.EQUIP, "None"));
+                }
+                else if ("Drop".equals(state.getMenuOption())) {
                     if (itemNameLower.contains("raw ") &&
                             (itemNameLower.contains("lobster") || itemNameLower.contains("shrimp") ||
                                     itemNameLower.contains("trout") || itemNameLower.contains("salmon") ||
@@ -70,19 +72,19 @@ public class InventoryProcessor {
                         events.add(new InventoryEvent(itemId, qtyLost, ActionType.DROP, "None"));
                     }
                 }
-                else if (isRune && justCastSpell) {
-                    events.add(new InventoryEvent(itemId, qtyLost, ActionType.SPELL_CAST, combatTarget));
+                else if (isRune && state.isJustCastSpell()) {
+                    events.add(new InventoryEvent(itemId, qtyLost, ActionType.SPELL_CAST, state.getCombatTarget()));
                 }
-                else if (isAmmo && justFiredRanged) {
-                    events.add(new InventoryEvent(itemId, qtyLost, ActionType.RANGED_FIRE, combatTarget));
+                else if (isAmmo && state.isJustFiredRanged()) {
+                    events.add(new InventoryEvent(itemId, qtyLost, ActionType.RANGED_FIRE, state.getCombatTarget()));
                 }
-                else if (inCombat && (CONSUME_OPTIONS.contains(lastMenuOptionClicked) || currentAnimation != -1)) {
-                    events.add(new InventoryEvent(itemId, qtyLost, ActionType.COMBAT_CONSUME, combatTarget));
+                else if (inCombat && (CONSUME_OPTIONS.contains(state.getMenuOption()) || state.getCurrentAnim() != -1)) {
+                    events.add(new InventoryEvent(itemId, qtyLost, ActionType.COMBAT_CONSUME, state.getCombatTarget()));
                 }
-                else if (FIREMAKE_OPTIONS.contains(lastAnimation)) {
+                else if (FIREMAKE_OPTIONS.contains(state.getLastAnim())) {
                     events.add(new InventoryEvent(itemId, qtyLost, ActionType.SKILLING_CONSUME, "Firemaking"));
                 }
-                else if (CONSUME_OPTIONS.contains(lastMenuOptionClicked)) {
+                else if (CONSUME_OPTIONS.contains(state.getMenuOption())) {
                     events.add(new InventoryEvent(itemId, qtyLost, ActionType.CONSUME, "None"));
                 }
                 else {
@@ -101,21 +103,22 @@ public class InventoryProcessor {
             if (newQty > oldQty) {
                 int qtyGained = newQty - oldQty;
 
-                if (isBanking) {
+                if (state.isBanking()) {
                     events.add(new InventoryEvent(itemId, qtyGained, ActionType.BANK_WITHDRAWAL, "Bank"));
                 }
-                // Strong Fishing detection
-                else if (lastAnimation == 619 || lastAnimation == 618 || lastAnimation == 621 ||
-                        currentAnimation == 619 || currentAnimation == 618 || currentAnimation == 621) {
+                else if (state.getLastAnim() == 619 || state.getLastAnim() == 618 || state.getLastAnim() == 621 ||
+                        state.getCurrentAnim() == 619 || state.getCurrentAnim() == 618 || state.getCurrentAnim() == 621) {
                     events.add(new InventoryEvent(itemId, qtyGained, ActionType.GATHER_GAIN, "None"));
                 }
-                // Default skilling gain
-                else if (lastMenuOptionClicked == null ||
-                        (!"Take".equals(lastMenuOptionClicked) && !"Drop".equals(lastMenuOptionClicked))) {
-                    events.add(new InventoryEvent(itemId, qtyGained, ActionType.GATHER_GAIN, lastMenuTargetClicked));
-                }
-                else if ("Take".equals(lastMenuOptionClicked)) {
+                else if ("Take".equals(state.getMenuOption())) {
                     events.add(new InventoryEvent(itemId, qtyGained, ActionType.TAKE, "None"));
+                }
+                // NEW: Catch unequipping (or forced unequip from swapping 2H weapons) before it becomes a GATHER_GAIN
+                else if ("Remove".equals(state.getMenuOption()) || EQUIP_OPTIONS.contains(state.getMenuOption())) {
+                    events.add(new InventoryEvent(itemId, qtyGained, ActionType.UNEQUIP, "None"));
+                }
+                else if (state.getMenuOption() == null || (!"Drop".equals(state.getMenuOption()) && !DESTROY_OPTIONS.contains(state.getMenuOption()))) {
+                    events.add(new InventoryEvent(itemId, qtyGained, ActionType.GATHER_GAIN, state.getMenuTarget()));
                 }
                 else {
                     events.add(new InventoryEvent(itemId, qtyGained, ActionType.GATHER_GAIN, "None"));

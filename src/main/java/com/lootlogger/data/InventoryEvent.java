@@ -1,10 +1,10 @@
 package com.lootlogger.data;
 
 public class InventoryEvent {
-    public String targetName;
-    public ActionType actionType;
-    public int itemId;
-    public int qty;
+    public final int itemId;
+    public final int qty;
+    public final ActionType actionType;
+    public final String targetName;
 
     public InventoryEvent(int itemId, int qty, ActionType actionType, String targetName) {
         this.itemId = itemId;
