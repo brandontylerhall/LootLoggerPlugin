@@ -15,10 +15,10 @@ public class GameEvent {
     @Builder.Default
     private String timestamp = Instant.now().toString();
 
-    private String eventType;     // SESSION_START, SESSION_END, GATHER_GAIN, XP_GAIN, NPC_DROP, BANK_DEPOSIT, etc.
-    private String category;      // Skilling, Combat, Banking, Misc
-    private String source;        // Mining, Fishing, Greater demon, Bank, etc.
-    private String target;        // For combat/spells/consumes
+    private String eventType;
+    private String category;
+    private String source;
+    private String target;
 
     private int x;
     private int y;
@@ -31,4 +31,7 @@ public class GameEvent {
     private Integer xpGained;
     private String skill;
     private String note;
+
+    // NEW: HP Tracking
+    private Integer hpHealed;
 }

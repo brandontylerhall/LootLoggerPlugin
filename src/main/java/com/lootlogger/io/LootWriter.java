@@ -22,6 +22,9 @@ public class LootWriter {
     private String supabaseUrl;
     private String supabaseKey;
 
+    // OPTIMIZATION: Instantiate the client ONCE
+    private final HttpClient httpClient = HttpClient.newHttpClient();
+
     private static class SupabasePayload {
         public Object log_data;
 
@@ -55,26 +58,20 @@ public class LootWriter {
             fileWriter.println(compactGson.toJson(record));
             fileWriter.flush();
         }
-
         batch.add(new SupabasePayload(record));
     }
 
     public void close() throws IOException {
-        if (fileWriter != null) {
-            fileWriter.close();
-        }
+        if (fileWriter != null) fileWriter.close();
     }
 
-    // sends bulk HTTP Request
     public synchronized void flush() {
         if (batch.isEmpty()) return;
 
         String jsonPayload = compactGson.toJson(batch);
-
         batch.clear();
 
         try {
-            HttpClient client = HttpClient.newHttpClient();
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(supabaseUrl + "/rest/v1/loot_logs"))
                     .header("Content-Type", "application/json")
@@ -84,18 +81,18 @@ public class LootWriter {
                     .POST(HttpRequest.BodyPublishers.ofString(jsonPayload))
                     .build();
 
-            client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+            // Use the reused httpClient
+            httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
                     .thenAccept(response -> {
                         if (response.statusCode() >= 200 && response.statusCode() < 300) {
-                            System.out.println(String.format("Successfully bulk-inserted to Supabase at %s!", ZonedDateTime.now(ZoneId.systemDefault())
-                                    .format(DateTimeFormatter.ISO_OFFSET_DATE_TIME)));
+                            // OPTIMIZATION: Swap System.out for Slf4j logging
+                            log.debug("Successfully bulk-inserted to Supabase at {}", ZonedDateTime.now(ZoneId.systemDefault()).format(DateTimeFormatter.ISO_OFFSET_DATE_TIME));
                         } else {
-                            System.out.println("Supabase Error: " + response.statusCode() + " - " + response.body());
+                            log.error("Supabase Error: {} - {}", response.statusCode(), response.body());
                         }
                     });
         } catch (Exception e) {
-            System.out.println("Failed to send bulk HTTP request!");
-            e.printStackTrace();
+            log.error("Failed to send bulk HTTP request!", e);
         }
     }
 }

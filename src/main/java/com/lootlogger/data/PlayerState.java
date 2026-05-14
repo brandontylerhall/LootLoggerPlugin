@@ -14,4 +14,5 @@ public class PlayerState {
     private boolean justCastSpell;
     private boolean justFiredRanged;
     private String combatTarget;
+    private String shopName;
 }
