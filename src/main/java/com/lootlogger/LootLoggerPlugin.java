@@ -10,6 +10,7 @@ import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.*;
 import net.runelite.api.widgets.Widget;
 import net.runelite.client.config.ConfigManager;
+import net.runelite.client.callback.ClientThread;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.game.ItemManager;
 import net.runelite.client.plugins.Plugin;
@@ -43,6 +44,9 @@ public class LootLoggerPlugin extends Plugin {
     private ItemManager itemManager;
 
     @Inject
+    private ClientThread clientThread;
+
+    @Inject
     private java.util.concurrent.ScheduledExecutorService executor;
 
     private static final Map<Integer, String> SKILL_MAP = Map.ofEntries(
@@ -71,6 +75,7 @@ public class LootLoggerPlugin extends Plugin {
 
     // --- SHOPPING TRACKERS ---
     private boolean isShopOpen = false;
+    private boolean isMonsterExamineOpen = false;
     private String lockedShopTarget = "Unknown Shop";
     private String currentShopName = "Unknown Shop";
 
@@ -220,13 +225,12 @@ public class LootLoggerPlugin extends Plugin {
         previousBoostedHp = client.getBoostedSkillLevel(Skill.HITPOINTS);
         lockedManualSpell = "";
 
+        // --- SHOPPING LOGIC ---
         Widget shopIndicator = client.getWidget(300, 0);
         boolean shopCurrentlyOpen = (shopIndicator != null && !shopIndicator.isHidden());
 
         if (shopCurrentlyOpen && !isShopOpen) {
-
             List<DroppedItem> stockItems = getShopItems();
-
             if (!stockItems.isEmpty()) {
                 isShopOpen = true;
                 currentShopName = getActiveShopName();
@@ -237,10 +241,7 @@ public class LootLoggerPlugin extends Plugin {
                 int x = 0, y = 0, plane = 0, regionId = 0;
                 if (localPlayer != null) {
                     WorldPoint wp = localPlayer.getWorldLocation();
-                    x = wp.getX();
-                    y = wp.getY();
-                    plane = wp.getPlane();
-                    regionId = wp.getRegionID();
+                    x = wp.getX(); y = wp.getY(); plane = wp.getPlane(); regionId = wp.getRegionID();
                 }
 
                 GameEvent snapshot = GameEvent.builder()
@@ -257,9 +258,95 @@ public class LootLoggerPlugin extends Plugin {
                 executor.execute(() -> lootWriter.queueRecord(snapshot));
             }
         } else if (!shopCurrentlyOpen && isShopOpen) {
-            log.info("[LL Debug] Shop closed. Resetting isShopOpen flag.");
             isShopOpen = false;
         }
+
+        // --- MONSTER EXAMINE LOGIC ---
+        // Group ID 522 is the Monster Examine interface in OSRS
+        boolean examineCurrentlyOpen = false;
+        for (int i = 0; i < 10; i++) {
+            Widget w = client.getWidget(522, i);
+            if (w != null && !w.isHidden()) {
+                examineCurrentlyOpen = true;
+                break;
+            }
+        }
+
+        if (examineCurrentlyOpen && !isMonsterExamineOpen) {
+            List<String> widgetTexts = new ArrayList<>();
+
+            // Scrape the text from the interface
+            for (int i = 0; i < 50; i++) {
+                widgetTexts.addAll(extractAllText(client.getWidget(522, i)));
+            }
+
+            // TICK RACE CONDITION FIX: Wait until the server actually sends the stat text!
+            boolean hasData = false;
+            for (String text : widgetTexts) {
+                String lower = text.toLowerCase();
+                if (lower.contains("aggressive") || lower.contains("defensive") || lower.contains("hitpoints")) {
+                    hasData = true;
+                    break;
+                }
+            }
+
+            if (hasData) {
+                isMonsterExamineOpen = true;
+                String targetMonster = (lockedCombatTarget != null && !lockedCombatTarget.isEmpty() && !lockedCombatTarget.equals("None"))
+                        ? lockedCombatTarget
+                        : "Unknown Monster";
+
+                log.info("[LL Debug] Monster Examine Data Extracted for: " + targetMonster);
+                gameMsg("[LL Debug] Scraped live stats for: " + targetMonster);
+
+                Player localPlayer = client.getLocalPlayer();
+                int x = 0, y = 0, plane = 0, regionId = 0;
+                if (localPlayer != null) {
+                    WorldPoint wp = localPlayer.getWorldLocation();
+                    x = wp.getX(); y = wp.getY(); plane = wp.getPlane(); regionId = wp.getRegionID();
+                }
+
+                GameEvent examineEvent = GameEvent.builder()
+                        .sessionId(sessionId)
+                        .eventType("MONSTER_EXAMINE")
+                        .category("Bestiary")
+                        .source(targetMonster)
+                        .target("None")
+                        .skill("Magic")
+                        .x(x).y(y).plane(plane).regionId(regionId)
+                        // Shove the entire text array into the note column separated by |
+                        .note(String.join("|", widgetTexts))
+                        .build();
+
+                executor.execute(() -> lootWriter.queueRecord(examineEvent));
+            }
+        } else if (!examineCurrentlyOpen && isMonsterExamineOpen) {
+            isMonsterExamineOpen = false;
+        }
+    }
+
+    private List<String> extractAllText(Widget w) {
+        List<String> texts = new ArrayList<>();
+        if (w == null) return texts;
+
+        if (w.getText() != null && !w.getText().trim().isEmpty()) {
+            String clean = Text.removeTags(w.getText()).trim();
+            if (!clean.isEmpty()) {
+                texts.add(clean);
+            }
+        }
+
+        if (w.getDynamicChildren() != null) {
+            for (Widget child : w.getDynamicChildren()) texts.addAll(extractAllText(child));
+        }
+        if (w.getStaticChildren() != null) {
+            for (Widget child : w.getStaticChildren()) texts.addAll(extractAllText(child));
+        }
+        if (w.getNestedChildren() != null) {
+            for (Widget child : w.getNestedChildren()) texts.addAll(extractAllText(child));
+        }
+
+        return texts;
     }
 
     private String getStandardAutocastSpell(int varp) {
