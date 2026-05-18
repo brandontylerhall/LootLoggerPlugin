@@ -54,6 +54,9 @@ public class LootLoggerPlugin extends Plugin {
     private ItemManager itemManager;
 
     @Inject
+    private ConfigManager configManager;
+
+    @Inject
     private ClientThread clientThread;
 
     @Inject
@@ -85,6 +88,7 @@ public class LootLoggerPlugin extends Plugin {
     private String lastDialogueNpc = "NPC / Dialogue";
     private List<DroppedItem> tickGainedItems = new ArrayList<>();
     private List<DroppedItem> tickLostItems = new ArrayList<>();
+    private final Map<String, Integer> activeQuestTicks = new HashMap<>();
     private int previousQuestPoints = -1;
     private String lastFinishedQuest = "Quest Reward"; // The shared memory variable!
     private int lastDialogueTick = 0;
@@ -193,16 +197,37 @@ public class LootLoggerPlugin extends Plugin {
         for (Quest quest : Quest.values()) {
             QuestState currentState = quest.getState(client);
             QuestState previousState = questStates.get(quest);
+            String questName = quest.getName();
 
+            // --- NEW: In-Game Tick Counter ---
+            if (currentState == QuestState.IN_PROGRESS) {
+                int ticks = activeQuestTicks.getOrDefault(questName, -1);
+
+                // If it's not in memory yet, try loading it from RuneLite's saved config
+                if (ticks == -1) {
+                    try {
+                        String saved = configManager.getConfiguration("lootlogger", "qticks_" + quest.getId());
+                        ticks = saved != null ? Integer.parseInt(saved) : 0;
+                    } catch (Exception e) {
+                        ticks = 0;
+                    }
+                }
+
+                ticks++;
+                activeQuestTicks.put(questName, ticks);
+
+                // Save to hard drive every 100 ticks (1 minute) so it persists across logouts
+                if (ticks % 100 == 0) {
+                    configManager.setConfiguration("lootlogger", "qticks_" + quest.getId(), ticks);
+                }
+            }
+
+            // --- Standard State Change Logic ---
             if (previousState != null && currentState != previousState) {
                 questStates.put(quest, currentState);
 
                 if (currentState == QuestState.IN_PROGRESS || currentState == QuestState.FINISHED) {
-                    String questName = quest.getName();
                     String stateStr = currentState.name();
-
-                    log.info("[LL Debug] Quest State Changed: {} -> {}", questName, stateStr);
-                    gameMsg("[LL Debug] Quest Progress Logged: " + questName + " (" + stateStr + ")");
 
                     if (currentState == QuestState.FINISHED) {
                         lastFinishedQuest = questName;
@@ -212,11 +237,11 @@ public class LootLoggerPlugin extends Plugin {
                     int x = 0, y = 0, plane = 0, regionId = 0;
                     if (localPlayer != null) {
                         WorldPoint wp = localPlayer.getWorldLocation();
-                        x = wp.getX();
-                        y = wp.getY();
-                        plane = wp.getPlane();
-                        regionId = wp.getRegionID();
+                        x = wp.getX(); y = wp.getY(); plane = wp.getPlane(); regionId = wp.getRegionID();
                     }
+
+                    // Grab the total accumulated ticks for this quest (default to 0 if it was pre-plugin)
+                    int finalTicks = activeQuestTicks.getOrDefault(questName, 0);
 
                     GameEvent questEvent = GameEvent.builder()
                             .sessionId(sessionId)
@@ -226,6 +251,7 @@ public class LootLoggerPlugin extends Plugin {
                             .target(stateStr)
                             .skill("None")
                             .x(x).y(y).plane(plane).regionId(regionId)
+                            .note("In-Game Ticks: " + finalTicks) // Inject ticks into the payload!
                             .build();
 
                     executor.execute(() -> lootWriter.queueRecord(questEvent));
