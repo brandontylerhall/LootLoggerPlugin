@@ -723,6 +723,8 @@ public class LootLoggerPlugin extends Plugin {
         NPC npc = event.getNpc();
         WorldPoint wp = npc.getWorldLocation();
 
+        int combatLevel = npc.getCombatLevel();
+
         List<DroppedItem> items = event.getItems().stream()
                 .map(item -> new DroppedItem(
                         item.getId(),
@@ -739,10 +741,12 @@ public class LootLoggerPlugin extends Plugin {
                 .eventType("NPC_DROP")
                 .category("Combat")
                 .source(npc.getName())
+                .skill("None")
                 .x(wp.getX())
                 .y(wp.getY())
                 .plane(wp.getPlane())
                 .regionId(wp.getRegionID())
+                .npcLevel(combatLevel)
                 .items(items)
                 .build();
 

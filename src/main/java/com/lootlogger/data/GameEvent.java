@@ -24,6 +24,7 @@ public class GameEvent {
     private int y;
     private int plane;
     private int regionId;
+    private Integer npcLevel;
 
     private List<DroppedItem> items;
 
