@@ -1,83 +1,47 @@
 package com.lootlogger;
 
 import com.google.inject.Provides;
-
-import com.lootlogger.data.*;
+import com.lootlogger.data.DroppedItem;
+import com.lootlogger.data.GameEvent;
 import com.lootlogger.io.LootWriter;
-import com.lootlogger.util.InventoryProcessor;
-
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.*;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.*;
 import net.runelite.api.widgets.Widget;
-import net.runelite.client.config.ConfigManager;
 import net.runelite.client.callback.ClientThread;
+import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
-import net.runelite.api.Quest;
-import net.runelite.api.QuestState;
 import net.runelite.client.game.ItemManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.events.NpcLootReceived;
 import net.runelite.client.task.Schedule;
 import net.runelite.client.util.Text;
-import net.runelite.api.events.ItemContainerChanged;
-import net.runelite.api.VarPlayer;
-import net.runelite.api.InventoryID;
-import net.runelite.api.ItemContainer;
 
 import javax.inject.Inject;
-import java.util.HashMap;
-import java.util.Map;
 import java.time.temporal.ChronoUnit;
-import java.util.ArrayList;
-import java.util.EnumMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 @Slf4j
 @PluginDescriptor(name = "Loot to JSON")
 public class LootLoggerPlugin extends Plugin {
-    @Inject
-    private Client client;
-
-    @Inject
-    private LootLoggerConfig config;
+    @Inject private Client client;
+    @Inject private LootLoggerConfig config;
+    @Inject private ItemManager itemManager;
+    @Inject private ConfigManager configManager;
+    @Inject private ClientThread clientThread;
+    @Inject private java.util.concurrent.ScheduledExecutorService executor;
 
     @Provides
     LootLoggerConfig provideConfig(ConfigManager configManager) {
         return configManager.getConfig(LootLoggerConfig.class);
     }
 
-    @Inject
-    private ItemManager itemManager;
-
-    @Inject
-    private ConfigManager configManager;
-
-    @Inject
-    private ClientThread clientThread;
-
-    @Inject
-    private java.util.concurrent.ScheduledExecutorService executor;
-
-    private static final Map<Integer, String> SKILL_MAP = Map.ofEntries(
-            Map.entry(879, "Woodcutting"),
-            Map.entry(877, "Woodcutting"),
-            Map.entry(875, "Woodcutting"),
-            Map.entry(625, "Mining"),
-            Map.entry(626, "Mining"),
-            Map.entry(627, "Mining"),
-            Map.entry(6756, "Mining"),
-            Map.entry(6752, "Mining"),
-            Map.entry(621, "Fishing")
-    );
-
     private String sessionId;
     private LootWriter lootWriter;
 
-    // DEBUG & STATE VARIABLES //
+    // --- STATE VARIABLES ---
     private int lastActiveAnimation = -1;
     private String lastMenuOptionClicked = "";
     private String lastMenuTargetClicked = "";
@@ -86,28 +50,29 @@ public class LootLoggerPlugin extends Plugin {
     private String lockedManualSpell = "";
     private int lastAutocastVarp = -1;
     private String lastDialogueNpc = "NPC / Dialogue";
-    private List<DroppedItem> tickGainedItems = new ArrayList<>();
-    private List<DroppedItem> tickLostItems = new ArrayList<>();
+
     private final Map<String, Integer> activeQuestTicks = new HashMap<>();
     private int previousQuestPoints = -1;
-    private String lastFinishedQuest = "Quest Reward"; // The shared memory variable!
+    private String lastFinishedQuest = "Quest Reward";
     private int lastDialogueTick = 0;
 
-    // --- SHOPPING TRACKERS ---
+    // --- NET DIFF ENGINE VARIABLES ---
+    private Map<Integer, Integer> previousNetItems = new HashMap<>();
+    private List<DroppedItem> lastNetGained = new ArrayList<>();
+    private List<DroppedItem> lastNetLost = new ArrayList<>();
+
+    private boolean hpInitialized = false;
+    private int previousBoostedHp = -1;
+
+    // --- UI TRACKERS ---
     private boolean isShopOpen = false;
     private boolean isMonsterExamineOpen = false;
     private String lockedShopTarget = "Unknown Shop";
     private String currentShopName = "Unknown Shop";
 
-    private int previousBoostedHp = -1;
-
-    private Item[] previousInventory = new Item[28];
-    private Item[] previousEquipment = new Item[14];
-
     private final Map<Skill, Integer> previousXpMap = new EnumMap<>(Skill.class);
     private final Map<Quest, QuestState> questStates = new EnumMap<>(Quest.class);
     private int questSyncTicks = 0;
-
 
     public void gameMsg(String msg) {
         if (!config.showChatMessages()) return;
@@ -121,21 +86,18 @@ public class LootLoggerPlugin extends Plugin {
         lootWriter.init();
         previousQuestPoints = client.getVarpValue(VarPlayer.QUEST_POINTS);
 
-        for (int i = 0; i < 28; i++) previousInventory[i] = new Item(-1, 0);
-        for (int i = 0; i < 14; i++) previousEquipment[i] = new Item(-1, 0);
-
+        previousNetItems.clear();
         previousXpMap.clear();
         questStates.clear();
         lastAutocastVarp = -1;
-        previousBoostedHp = -1;
+        hpInitialized = false;
         isShopOpen = false;
 
         if (client.getGameState() == GameState.LOGGED_IN) {
             seedXpMap();
             seedQuestMap();
-            questSyncTicks = 3; // NEW: Start the 9-second grace period
+            questSyncTicks = 3;
             lastAutocastVarp = client.getVarpValue(108);
-            previousBoostedHp = client.getBoostedSkillLevel(Skill.HITPOINTS);
         }
         log.info("[LL Debug] Plugin Started.");
     }
@@ -146,14 +108,11 @@ public class LootLoggerPlugin extends Plugin {
             lootWriter.flush();
             lootWriter.close();
         }
-        previousXpMap.clear();
     }
 
     @Schedule(period = 10, unit = ChronoUnit.SECONDS, asynchronous = true)
     public void submitBatch() {
-        if (lootWriter != null) {
-            lootWriter.flush();
-        }
+        if (lootWriter != null) lootWriter.flush();
     }
 
     private void seedXpMap() {
@@ -173,175 +132,29 @@ public class LootLoggerPlugin extends Plugin {
         if (event.getGameState() == GameState.LOGGED_IN) {
             seedXpMap();
             seedQuestMap();
-            questSyncTicks = 3; // NEW: Start the 9-second grace period
+            questSyncTicks = 3;
             lastAutocastVarp = client.getVarpValue(108);
-            previousBoostedHp = client.getBoostedSkillLevel(Skill.HITPOINTS);
             previousQuestPoints = client.getVarpValue(VarPlayer.QUEST_POINTS);
+
+            hpInitialized = false; // Forces safe HP calibration on next tick
+            previousNetItems.clear(); // Prevents fake item diffs on login
         } else {
-            // Pause checking if they hop worlds or log out
             questSyncTicks = 0;
         }
     }
 
-    private void checkQuestProgress() {
-        // --- NEW: Grace Period Logic ---
-        if (questSyncTicks > 0) {
-            questSyncTicks--;
-            if (questSyncTicks == 0) {
-                seedQuestMap(); // Re-seed with the true, synced server values
-            }
-            return; // Skip checking until the sync is complete
-        }
-
-        // --- Standard Quest Logic ---
-        for (Quest quest : Quest.values()) {
-            QuestState currentState = quest.getState(client);
-            QuestState previousState = questStates.get(quest);
-            String questName = quest.getName();
-
-            // --- NEW: In-Game Tick Counter ---
-            if (currentState == QuestState.IN_PROGRESS) {
-                int ticks = activeQuestTicks.getOrDefault(questName, -1);
-
-                // If it's not in memory yet, try loading it from RuneLite's saved config
-                if (ticks == -1) {
-                    try {
-                        String saved = configManager.getConfiguration("lootlogger", "qticks_" + quest.getId());
-                        ticks = saved != null ? Integer.parseInt(saved) : 0;
-                    } catch (Exception e) {
-                        ticks = 0;
-                    }
-                }
-
-                ticks++;
-                activeQuestTicks.put(questName, ticks);
-
-                // Save to hard drive every 100 ticks (1 minute) so it persists across logouts
-                if (ticks % 100 == 0) {
-                    configManager.setConfiguration("lootlogger", "qticks_" + quest.getId(), ticks);
-                }
-            }
-
-            // --- Standard State Change Logic ---
-            if (previousState != null && currentState != previousState) {
-                questStates.put(quest, currentState);
-
-                if (currentState == QuestState.IN_PROGRESS || currentState == QuestState.FINISHED) {
-                    String stateStr = currentState.name();
-
-                    if (currentState == QuestState.FINISHED) {
-                        lastFinishedQuest = questName;
-                    }
-
-                    Player localPlayer = client.getLocalPlayer();
-                    int x = 0, y = 0, plane = 0, regionId = 0;
-                    if (localPlayer != null) {
-                        WorldPoint wp = localPlayer.getWorldLocation();
-                        x = wp.getX(); y = wp.getY(); plane = wp.getPlane(); regionId = wp.getRegionID();
-                    }
-
-                    // Grab the total accumulated ticks for this quest (default to 0 if it was pre-plugin)
-                    int finalTicks = activeQuestTicks.getOrDefault(questName, 0);
-
-                    GameEvent questEvent = GameEvent.builder()
-                            .sessionId(sessionId)
-                            .eventType("QUEST_PROGRESS")
-                            .category("Quests")
-                            .source(questName)
-                            .target(stateStr)
-                            .skill("None")
-                            .x(x).y(y).plane(plane).regionId(regionId)
-                            .note("In-Game Ticks: " + finalTicks) // Inject ticks into the payload!
-                            .build();
-
-                    executor.execute(() -> lootWriter.queueRecord(questEvent));
-                }
-            }
-        }
-    }
-
-    private String getActiveShopName() {
-        int[] primaryLocations = {1, 2, 78};
-        for (int id : primaryLocations) {
-            Widget w = client.getWidget(300, id);
-            if (w != null && w.getText() != null && !w.getText().isEmpty()) {
-                String clean = Text.removeTags(w.getText()).trim();
-                if (clean.length() > 3 && !clean.equalsIgnoreCase("Close") && !clean.contains("Value check")) {
-                    return clean;
-                }
-            }
-
-            if (w != null && w.getChildren() != null) {
-                for (Widget child : w.getChildren()) {
-                    if (child != null && child.getText() != null && !child.getText().isEmpty()) {
-                        String clean = Text.removeTags(child.getText()).trim();
-                        if (clean.length() > 3 && !clean.equalsIgnoreCase("Close") && !clean.contains("Value check")) {
-                            return clean;
-                        }
-                    }
-                }
-            }
-        }
-
-        String fallback = lockedShopTarget.trim();
-        if (fallback.isEmpty() || fallback.equals("Unknown Shop")) return "Unknown Shop";
-
-        if (!fallback.toLowerCase().contains("shop") && !fallback.toLowerCase().contains("store")) {
-            return fallback + " Shop";
-        }
-        return fallback;
-    }
-
-    private List<DroppedItem> getShopItems() {
-        List<DroppedItem> stockItems = new ArrayList<>();
-
-        Widget itemGrid = client.getWidget(300, 16);
-        if (itemGrid != null && itemGrid.getChildren() != null) {
-            for (Widget itemWidget : itemGrid.getChildren()) {
-                int itemId = itemWidget.getItemId();
-                int qty = itemWidget.getItemQuantity();
-
-                if (itemId > 0) {
-                    int canonicalId = itemManager.canonicalize(itemId);
-                    String name = itemManager.getItemComposition(canonicalId).getName();
-                    stockItems.add(new DroppedItem(
-                            canonicalId, name, qty,
-                            itemManager.getItemPrice(canonicalId) * qty,
-                            itemManager.getItemComposition(canonicalId).getHaPrice() * qty,
-                            itemManager.getItemComposition(canonicalId).getPrice() * qty
-                    ));
-                }
-            }
-        }
-
-        if (stockItems.isEmpty()) {
-            ItemContainer shopContainer = client.getItemContainer(3);
-            if (shopContainer != null) {
-                for (Item item : shopContainer.getItems()) {
-                    if (item.getId() != -1) {
-                        int canonicalId = itemManager.canonicalize(item.getId());
-                        String name = itemManager.getItemComposition(canonicalId).getName();
-                        int qty = item.getQuantity();
-                        stockItems.add(new DroppedItem(
-                                canonicalId, name, qty,
-                                itemManager.getItemPrice(canonicalId) * qty,
-                                itemManager.getItemComposition(canonicalId).getHaPrice() * qty,
-                                itemManager.getItemComposition(canonicalId).getPrice() * qty
-                        ));
-                    }
-                }
-            }
-        }
-
-        return stockItems;
-    }
-
     @Subscribe
     public void onGameTick(GameTick event) {
-        checkQuestProgress(); // NEW
+        // Safely calibrate HP on the very first tick after login/startup
+        if (!hpInitialized) {
+            previousBoostedHp = client.getBoostedSkillLevel(Skill.HITPOINTS);
+            hpInitialized = true;
+        }
 
-        previousBoostedHp = client.getBoostedSkillLevel(Skill.HITPOINTS);
-        lockedManualSpell = "";
+        checkQuestProgress();
+        processNetItemDiff();
+
+        lockedManualSpell = ""; // Clear manual cast at end of tick
 
         // --- SHOPPING LOGIC ---
         Widget shopIndicator = client.getWidget(300, 0);
@@ -352,38 +165,14 @@ public class LootLoggerPlugin extends Plugin {
             if (!stockItems.isEmpty()) {
                 isShopOpen = true;
                 currentShopName = getActiveShopName();
-
-                log.info("[LL Debug] Shop Snapshot Triggered. Extracted {} unique items for: {}", stockItems.size(), currentShopName);
-
-                Player localPlayer = client.getLocalPlayer();
-                int x = 0, y = 0, plane = 0, regionId = 0;
-                if (localPlayer != null) {
-                    WorldPoint wp = localPlayer.getWorldLocation();
-                    x = wp.getX();
-                    y = wp.getY();
-                    plane = wp.getPlane();
-                    regionId = wp.getRegionID();
-                }
-
-                GameEvent snapshot = GameEvent.builder()
-                        .sessionId(sessionId)
-                        .eventType("SHOP_SNAPSHOT")
-                        .category("Shopping")
-                        .source(currentShopName)
-                        .target("None")
-                        .skill("None")
-                        .x(x).y(y).plane(plane).regionId(regionId)
-                        .items(stockItems)
-                        .build();
-
-                executor.execute(() -> lootWriter.queueRecord(snapshot));
+                log.info("[LL Debug] Shop Snapshot Triggered for: {}", currentShopName);
+                queueEvent("SHOP_SNAPSHOT", "Shopping", currentShopName, "None", stockItems, 0, "");
             }
         } else if (!shopCurrentlyOpen && isShopOpen) {
             isShopOpen = false;
         }
 
         // --- MONSTER EXAMINE LOGIC ---
-        // Group ID 522 is the Monster Examine interface in OSRS
         boolean examineCurrentlyOpen = false;
         for (int i = 0; i < 10; i++) {
             Widget w = client.getWidget(522, i);
@@ -393,192 +182,186 @@ public class LootLoggerPlugin extends Plugin {
             }
         }
 
-        // Cache the last speaking NPC's name for dialogue rewards
         Widget npcNameWidget = client.getWidget(231, 4);
         if (npcNameWidget != null && !npcNameWidget.isHidden() && npcNameWidget.getText() != null) {
-            String cleanName = net.runelite.client.util.Text.removeTags(npcNameWidget.getText());
-            if (!cleanName.isEmpty()) {
-                lastDialogueNpc = cleanName;
-            }
+            String cleanName = Text.removeTags(npcNameWidget.getText());
+            if (!cleanName.isEmpty()) lastDialogueNpc = cleanName;
         }
 
         if (examineCurrentlyOpen && !isMonsterExamineOpen) {
             List<String> widgetTexts = new ArrayList<>();
+            for (int i = 0; i < 50; i++) widgetTexts.addAll(extractAllText(client.getWidget(522, i)));
 
-            // Scrape the text from the interface
-            for (int i = 0; i < 50; i++) {
-                widgetTexts.addAll(extractAllText(client.getWidget(522, i)));
-            }
-
-            // TICK RACE CONDITION FIX: Wait until the server actually sends the stat text!
-            boolean hasData = false;
-            for (String text : widgetTexts) {
-                String lower = text.toLowerCase();
-                if (lower.contains("aggressive") || lower.contains("defensive") || lower.contains("hitpoints")) {
-                    hasData = true;
-                    break;
-                }
-            }
+            boolean hasData = widgetTexts.stream().map(String::toLowerCase)
+                    .anyMatch(t -> t.contains("aggressive") || t.contains("defensive") || t.contains("hitpoints"));
 
             if (hasData) {
                 isMonsterExamineOpen = true;
-                String targetMonster = (lockedCombatTarget != null && !lockedCombatTarget.isEmpty() && !lockedCombatTarget.equals("None"))
-                        ? lockedCombatTarget
-                        : "Unknown Monster";
-
-                log.info("[LL Debug] Monster Examine Data Extracted for: " + targetMonster);
-                gameMsg("[LL Debug] Scraped live stats for: " + targetMonster);
-
-                Player localPlayer = client.getLocalPlayer();
-                int x = 0, y = 0, plane = 0, regionId = 0;
-                if (localPlayer != null) {
-                    WorldPoint wp = localPlayer.getWorldLocation();
-                    x = wp.getX();
-                    y = wp.getY();
-                    plane = wp.getPlane();
-                    regionId = wp.getRegionID();
-                }
-
-                GameEvent examineEvent = GameEvent.builder()
-                        .sessionId(sessionId)
-                        .eventType("MONSTER_EXAMINE")
-                        .category("Bestiary")
-                        .source(targetMonster)
-                        .target("None")
-                        .skill("Magic")
-                        .x(x).y(y).plane(plane).regionId(regionId)
-                        // Shove the entire text array into the note column separated by |
-                        .note(String.join("|", widgetTexts))
-                        .build();
-
-                executor.execute(() -> lootWriter.queueRecord(examineEvent));
+                String targetMonster = (lockedCombatTarget != null && !lockedCombatTarget.isEmpty() && !lockedCombatTarget.equals("None")) ? lockedCombatTarget : "Unknown Monster";
+                queueEvent("MONSTER_EXAMINE", "Bestiary", targetMonster, "Magic", new ArrayList<>(), 0, String.join("|", widgetTexts));
             }
         } else if (!examineCurrentlyOpen && isMonsterExamineOpen) {
             isMonsterExamineOpen = false;
         }
 
-        // --- TICK CLEANUP ---
-        tickGainedItems.clear();
-        tickLostItems.clear();
-
-        // --- NEW: Quest Point Tracker (Moved here to fix Race Condition) ---
+        // --- QUEST POINT TRACKER ---
         int currentQp = client.getVarpValue(VarPlayer.QUEST_POINTS);
-
         if (previousQuestPoints != -1 && currentQp > previousQuestPoints) {
             int qpGained = currentQp - previousQuestPoints;
             previousQuestPoints = currentQp;
-
-            log.info("[LL Debug] Gained {} Quest Points!", qpGained);
-            gameMsg("[LL Debug] Logged Quest Point Gain: " + qpGained + " from " + lastFinishedQuest);
-
-            Player localPlayer = client.getLocalPlayer();
-            int x = 0, y = 0, plane = 0, regionId = 0;
-            if (localPlayer != null) {
-                WorldPoint wp = localPlayer.getWorldLocation();
-                x = wp.getX();
-                y = wp.getY();
-                plane = wp.getPlane();
-                regionId = wp.getRegionID();
-            }
-
-            List<DroppedItem> virtualQpItem = new ArrayList<>();
-            virtualQpItem.add(new DroppedItem(-1, "Quest point", qpGained, 0, 0, 0));
-
-            GameEvent qpEvent = GameEvent.builder()
-                    .sessionId(sessionId)
-                    .eventType("DIALOGUE_REWARD")
-                    .category("Quests")
-                    .source(lastFinishedQuest) // Now perfectly synced!
-                    .target("None")
-                    .skill("None")
-                    .x(x).y(y).plane(plane).regionId(regionId)
-                    .items(virtualQpItem)
-                    .build();
-
-            executor.execute(() -> lootWriter.queueRecord(qpEvent));
-
+            queueEvent("DIALOGUE_REWARD", "Quests", lastFinishedQuest, "None", List.of(new DroppedItem(-1, "Quest point", qpGained, 0, 0, 0)), 0, "");
         } else if (previousQuestPoints == -1 || currentQp < previousQuestPoints) {
             previousQuestPoints = currentQp;
         }
+
+        // CRITICAL FIX: Sync HP at the very end of the tick to capture real damage taken between eats
+        previousBoostedHp = client.getBoostedSkillLevel(Skill.HITPOINTS);
     }
 
-    private List<String> extractAllText(Widget w) {
-        List<String> texts = new ArrayList<>();
-        if (w == null) return texts;
+    /**
+     * THE NET-DIFF ENGINE
+     */
+    private void processNetItemDiff() {
+        Map<Integer, Integer> currentNetItems = new HashMap<>();
 
-        if (w.getText() != null && !w.getText().trim().isEmpty()) {
-            String clean = Text.removeTags(w.getText()).trim();
-            if (!clean.isEmpty()) {
-                texts.add(clean);
+        ItemContainer inv = client.getItemContainer(InventoryID.INVENTORY);
+        if (inv != null) {
+            for (Item item : inv.getItems()) {
+                if (item.getId() != -1) currentNetItems.put(item.getId(), currentNetItems.getOrDefault(item.getId(), 0) + item.getQuantity());
             }
         }
 
-        if (w.getDynamicChildren() != null) {
-            for (Widget child : w.getDynamicChildren()) texts.addAll(extractAllText(child));
-        }
-        if (w.getStaticChildren() != null) {
-            for (Widget child : w.getStaticChildren()) texts.addAll(extractAllText(child));
-        }
-        if (w.getNestedChildren() != null) {
-            for (Widget child : w.getNestedChildren()) texts.addAll(extractAllText(child));
+        ItemContainer eq = client.getItemContainer(InventoryID.EQUIPMENT);
+        if (eq != null) {
+            for (Item item : eq.getItems()) {
+                if (item.getId() != -1) currentNetItems.put(item.getId(), currentNetItems.getOrDefault(item.getId(), 0) + item.getQuantity());
+            }
         }
 
-        return texts;
+        if (previousNetItems.isEmpty() && !currentNetItems.isEmpty()) {
+            previousNetItems = currentNetItems;
+            return;
+        }
+
+        List<DroppedItem> netGained = new ArrayList<>();
+        List<DroppedItem> netLost = new ArrayList<>();
+
+        for (Map.Entry<Integer, Integer> entry : currentNetItems.entrySet()) {
+            int id = entry.getKey();
+            int qty = entry.getValue();
+            int prev = previousNetItems.getOrDefault(id, 0);
+            if (qty > prev) netGained.add(createDroppedItem(id, qty - prev));
+        }
+        for (Map.Entry<Integer, Integer> entry : previousNetItems.entrySet()) {
+            int id = entry.getKey();
+            int prev = entry.getValue();
+            int current = currentNetItems.getOrDefault(id, 0);
+            if (prev > current) netLost.add(createDroppedItem(id, prev - current));
+        }
+
+        lastNetGained = netGained;
+        lastNetLost = netLost;
+
+        // Push the sync BEFORE early exits to prevent bank chaos!
+        previousNetItems = currentNetItems;
+
+        // CRITICAL FIX: Ignore changes made while banking or depositing
+        boolean isBankOpen = client.getWidget(12, 0) != null && !client.getWidget(12, 0).isHidden();
+        boolean isGeOpen = client.getWidget(465, 0) != null && !client.getWidget(465, 0).isHidden();
+        boolean isDepositBoxOpen = client.getWidget(192, 0) != null && !client.getWidget(192, 0).isHidden();
+        if (isBankOpen || isGeOpen || isDepositBoxOpen) return;
+
+        // Calculate total HP change for this tick
+        int currentHp = client.getBoostedSkillLevel(Skill.HITPOINTS);
+        int tickHpHealed = Math.max(0, currentHp - previousBoostedHp);
+        boolean healLogged = false; // Combo-eat interceptor
+
+        // --- 1. PROCESS LOSSES (Consumables, Runes, Ammo) ---
+        if (!netLost.isEmpty()) {
+            for (DroppedItem lostItem : netLost) {
+                ItemComposition comp = itemManager.getItemComposition(lostItem.getId());
+                String nameLower = comp != null ? comp.getName().toLowerCase() : "";
+
+                // Dynamically check client cache to see if item has an Eat/Drink option
+                boolean isConsumable = false;
+                if (comp != null && comp.getInventoryActions() != null) {
+                    for (String action : comp.getInventoryActions()) {
+                        if (action != null && (action.equalsIgnoreCase("Eat") || action.equalsIgnoreCase("Drink"))) {
+                            isConsumable = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (isConsumable) {
+                    // Give the total HP healed to the first item processed. 0 for the combo-eaten item.
+                    int assignedHeal = healLogged ? 0 : tickHpHealed;
+                    healLogged = true;
+                    queueEvent("CONSUME", "Combat", "Activity", "Hitpoints", List.of(lostItem), assignedHeal, "");
+                }
+                else if (nameLower.endsWith(" rune")) {
+                    String target = (lockedCombatTarget != null && !lockedCombatTarget.equals("None")) ? lockedCombatTarget : "Enemy";
+                    queueEvent("SPELL_CAST", "Combat", target, "Magic", List.of(lostItem), 0, "");
+                }
+                else if (nameLower.contains("arrow") || nameLower.contains("bolt") || nameLower.contains("dart") || nameLower.contains("javelin") || nameLower.contains("throwing") || nameLower.contains("chinchompa")) {
+                    String target = (lockedCombatTarget != null && !lockedCombatTarget.equals("None")) ? lockedCombatTarget : "Enemy";
+                    queueEvent("RANGED_FIRE", "Combat", target, "Ranged", List.of(lostItem), 0, "");
+                }
+            }
+        }
+
+        // --- 2. PROCESS GAINS (Loot, Shop, Quests) ---
+        if (!netGained.isEmpty()) {
+            boolean isDialogueOpen = false;
+            int[] dialogGroups = {231, 217, 193, 229, 277};
+            for (int groupId : dialogGroups) {
+                Widget w = client.getWidget(groupId, 0);
+                if (w != null && !w.isHidden()) {
+                    isDialogueOpen = true;
+                    break;
+                }
+            }
+            if (isDialogueOpen) lastDialogueTick = client.getTickCount();
+            boolean wasDialogueRecentlyOpen = (client.getTickCount() - lastDialogueTick) <= 3;
+
+            String opt = lastMenuOptionClicked != null ? lastMenuOptionClicked.toLowerCase() : "";
+
+            if (isShopOpen || (client.getWidget(300, 0) != null && !client.getWidget(300, 0).isHidden())) {
+                queueEvent("SHOP_TRANSACTION", "Shopping", currentShopName, "None", netGained, 0, "Spent: " + formatLostItems(netLost));
+            } else if (wasDialogueRecentlyOpen) {
+                boolean isQuestReward = (client.getWidget(277, 0) != null && !client.getWidget(277, 0).isHidden()) || (lastFinishedQuest != null && !lastFinishedQuest.equals("Quest Reward"));
+                String category = isQuestReward ? "Quests" : "NPC Interaction";
+                String source = category.equals("Quests") ? lastFinishedQuest : lastDialogueNpc;
+                queueEvent("DIALOGUE_REWARD", category, source, "None", netGained, 0, "Spent: " + formatLostItems(netLost));
+            } else if (opt.equals("take")) {
+                queueEvent("TAKE", "Misc", "Pickup", "None", netGained, 0, "");
+            }
+        }
     }
 
-    private String getStandardAutocastSpell(int varp) {
-        switch (varp) {
-            case 3:
-                return "Wind Strike";
-            case 5:
-                return "Water Strike";
-            case 7:
-                return "Earth Strike";
-            case 9:
-                return "Fire Strike";
-            case 11:
-                return "Wind Bolt";
-            case 13:
-                return "Water Bolt";
-            case 15:
-                return "Earth Bolt";
-            case 17:
-                return "Fire Bolt";
-            case 19:
-                return "Wind Blast";
-            case 21:
-                return "Water Blast";
-            case 23:
-                return "Earth Blast";
-            case 25:
-                return "Fire Blast";
-            case 27:
-                return "Wind Wave";
-            case 29:
-                return "Water Wave";
-            case 31:
-                return "Earth Wave";
-            case 33:
-                return "Fire Wave";
-            case 35:
-                return "Wind Surge";
-            case 37:
-                return "Water Surge";
-            case 39:
-                return "Earth Surge";
-            case 41:
-                return "Fire Surge";
-            default:
-                return "Unknown Autocast (" + varp + ")";
+    // --- REUSABLE EVENT DISPATCHER ---
+    private void queueEvent(String eventType, String category, String source, String skill, List<DroppedItem> items, int hpHealed, String note) {
+        Player localPlayer = client.getLocalPlayer();
+        int x = 0, y = 0, plane = 0, regionId = 0;
+        if (localPlayer != null) {
+            WorldPoint wp = localPlayer.getWorldLocation();
+            x = wp.getX(); y = wp.getY(); plane = wp.getPlane(); regionId = wp.getRegionID();
         }
-    }
 
-    @Subscribe
-    public void onVarbitChanged(VarbitChanged event) {
-        int currentVarp = client.getVarpValue(108);
-        if (currentVarp != lastAutocastVarp) {
-            lastAutocastVarp = currentVarp;
-        }
+        GameEvent event = GameEvent.builder()
+                .sessionId(sessionId)
+                .eventType(eventType)
+                .category(category)
+                .source(source)
+                .target("None")
+                .skill(skill)
+                .x(x).y(y).plane(plane).regionId(regionId)
+                .items(items)
+                .hpHealed(hpHealed)
+                .note(note)
+                .build();
+
+        executor.execute(() -> lootWriter.queueRecord(event));
     }
 
     @Subscribe
@@ -591,10 +374,8 @@ public class LootLoggerPlugin extends Plugin {
             return;
         }
 
-        int previousXp = previousXpMap.get(skill);
-        int xpDelta = currentXp - previousXp;
+        int xpDelta = currentXp - previousXpMap.get(skill);
         previousXpMap.put(skill, currentXp);
-
         if (xpDelta <= 0) return;
 
         boolean isCombatSkill = skill == Skill.ATTACK || skill == Skill.STRENGTH ||
@@ -604,94 +385,39 @@ public class LootLoggerPlugin extends Plugin {
         String category = isCombatSkill ? "Combat" : "Skilling";
         String targetSource = isCombatSkill ? lockedCombatTarget : lockedSkillingTarget;
 
-        // Magic override logic...
         if (skill == Skill.MAGIC) {
-            if (!lockedManualSpell.isEmpty()) {
-                targetSource = lockedManualSpell;
-            } else {
+            if (!lockedManualSpell.isEmpty()) targetSource = lockedManualSpell;
+            else {
                 int autoCastVarp = client.getVarpValue(108);
-                if (autoCastVarp > 0) {
-                    targetSource = getStandardAutocastSpell(autoCastVarp);
-                } else {
-                    targetSource = "Generic Magic";
-                }
+                targetSource = autoCastVarp > 0 ? getStandardAutocastSpell(autoCastVarp) : "Generic Magic";
             }
         }
 
-        // NEW: The Intelligent Skilling Override
         if (!isCombatSkill) {
-            // If we have no idea what we are doing, OR if the memory is stale...
             if (targetSource == null || targetSource.equals("Unknown") || targetSource.isEmpty()) {
-
-                // 1. UI Check: Is a Quest Complete scroll open? (Widget 277)
-                if (client.getWidget(277, 0) != null && !client.getWidget(277, 0).isHidden()) {
-                    targetSource = "Quest Reward";
-                }
-                // 2. UI Check: Is an Item/Lamp Sprite box open? (Widget 193)
-                else if (client.getWidget(193, 0) != null && !client.getWidget(193, 0).isHidden()) {
-                    targetSource = "XP Lamp / Reward";
-                }
-                // 3. Inventory Diff Check: Did we consume a resource? (Cooking, Fletching)
-                else if (!tickLostItems.isEmpty()) {
-                    targetSource = tickLostItems.get(0).getName();
-                }
-                // 4. Inventory Diff Check: Did we gain a resource? (Thieving, Mining empty-handed)
-                // Replace the block above with this:
-                else if (!tickGainedItems.isEmpty()) {
-                    // Only use the item as a source if it's NOT a generic inventory key/misc item
-                    String itemName = tickGainedItems.get(0).getName().toLowerCase();
-                    if (itemName.contains("key") || itemName.contains("bone")) {
-                        targetSource = "Activity"; // Force fallback to avoid "Key" or "Bones" as a skill source
-                    } else {
-                        targetSource = tickGainedItems.get(0).getName();
-                    }
-                }
-                // 5. Absolute Fallback
-                else {
-                    targetSource = "Activity";
-                }
+                if (client.getWidget(277, 0) != null && !client.getWidget(277, 0).isHidden()) targetSource = "Quest Reward";
+                else if (client.getWidget(193, 0) != null && !client.getWidget(193, 0).isHidden()) targetSource = "XP Lamp / Reward";
+                else if (!lastNetLost.isEmpty()) targetSource = lastNetLost.get(0).getName();
+                else if (!lastNetGained.isEmpty()) {
+                    String itemName = lastNetGained.get(0).getName().toLowerCase();
+                    targetSource = (itemName.contains("key") || itemName.contains("bone")) ? "Activity" : lastNetGained.get(0).getName();
+                } else targetSource = "Activity";
             }
         }
 
-        // Clean up arrow strings if they still exist
         if (targetSource != null && targetSource.contains("->")) {
             String[] parts = targetSource.split("->");
             targetSource = parts[parts.length - 1].trim();
         }
 
-        // One last safety net so we never log "Unknown" or empty strings to Supabase again
-        String finalSource = (targetSource != null && !targetSource.equals("Unknown") && !targetSource.isEmpty())
-                ? targetSource
-                : "Activity";
-
-        Player localPlayer = client.getLocalPlayer();
-        int x = 0, y = 0, plane = 0, regionId = 0;
-        if (localPlayer != null) {
-            WorldPoint wp = localPlayer.getWorldLocation();
-            x = wp.getX();
-            y = wp.getY();
-            plane = wp.getPlane();
-            regionId = wp.getRegionID();
-        }
-
-        GameEvent record = GameEvent.builder()
-                .sessionId(sessionId)
-                .eventType("XP_GAIN")
-                .category(category)
-                .source(finalSource) // FIX: Use our thoroughly checked variable
-                .skill(skill.getName())
-                .xpGained(xpDelta)
-                .x(x).y(y).plane(plane).regionId(regionId)
-                .build();
-
-        executor.execute(() -> lootWriter.queueRecord(record));
+        String finalSource = (targetSource != null && !targetSource.equals("Unknown") && !targetSource.isEmpty()) ? targetSource : "Activity";
+        queueEvent("XP_GAIN", category, finalSource, skill.getName(), new ArrayList<>(), 0, "XP Gained: " + xpDelta);
     }
 
     @Subscribe
     public void onMenuOptionClicked(MenuOptionClicked event) {
         lastMenuOptionClicked = Text.removeTags(event.getMenuOption());
-        String rawTarget = Text.removeTags(event.getMenuTarget());
-        lastMenuTargetClicked = rawTarget.replaceAll("\\s*\\(level-\\d+\\)", "").trim();
+        lastMenuTargetClicked = Text.removeTags(event.getMenuTarget()).replaceAll("\\s*\\(level-\\d+\\)", "").trim();
 
         String opt = lastMenuOptionClicked.toLowerCase();
 
@@ -719,302 +445,125 @@ public class LootLoggerPlugin extends Plugin {
     }
 
     @Subscribe
-    public void onCommandExecuted(CommandExecuted event) {
-        if (event.getCommand().equals("status")) {
-            gameMsg("Status printed to console/logs.");
-        }
-    }
-
-    @Subscribe
     public void onNpcLootReceived(NpcLootReceived event) {
-        NPC npc = event.getNpc();
-        WorldPoint wp = npc.getWorldLocation();
-
-        int combatLevel = npc.getCombatLevel();
-
-        List<DroppedItem> items = event.getItems().stream()
-                .map(item -> new DroppedItem(
-                        item.getId(),
-                        itemManager.getItemComposition(item.getId()).getName(),
-                        item.getQuantity(),
-                        (itemManager.getItemPrice(item.getId()) * item.getQuantity()),
-                        (itemManager.getItemComposition(item.getId()).getHaPrice() * item.getQuantity()),
-                        (itemManager.getItemComposition(item.getId()).getPrice() * item.getQuantity())
-                ))
-                .collect(java.util.stream.Collectors.toList());
-
-        GameEvent record = GameEvent.builder()
-                .sessionId(sessionId)
-                .eventType("NPC_DROP")
-                .category("Combat")
-                .source(npc.getName())
-                .skill("None")
-                .x(wp.getX())
-                .y(wp.getY())
-                .plane(wp.getPlane())
-                .regionId(wp.getRegionID())
-                .npcLevel(combatLevel)
-                .items(items)
-                .build();
-
-        executor.execute(() -> lootWriter.queueRecord(record));
+        List<DroppedItem> items = new ArrayList<>();
+        event.getItems().forEach(item -> items.add(createDroppedItem(item.getId(), item.getQuantity())));
+        queueEvent("NPC_DROP", "Combat", event.getNpc().getName(), "None", items, 0, "");
     }
 
     @Subscribe
     public void onAnimationChanged(AnimationChanged event) {
-        if (event.getActor() != client.getLocalPlayer()) return;
-        int animId = client.getLocalPlayer().getAnimation();
-        if (animId != -1) lastActiveAnimation = animId;
+        if (event.getActor() == client.getLocalPlayer() && client.getLocalPlayer().getAnimation() != -1) {
+            lastActiveAnimation = client.getLocalPlayer().getAnimation();
+        }
     }
 
-    private void logRangedFire(int itemId, int qty) {
-        String name = itemManager.getItemComposition(itemId).getName();
-        List<DroppedItem> eventItems = List.of(new DroppedItem(
-                itemId, name, qty,
-                (itemManager.getItemPrice(itemId) * qty),
-                (itemManager.getItemComposition(itemId).getHaPrice() * qty),
-                (itemManager.getItemComposition(itemId).getPrice() * qty)
-        ));
+    @Subscribe
+    public void onVarbitChanged(VarbitChanged event) {
+        int currentVarp = client.getVarpValue(108);
+        if (currentVarp != lastAutocastVarp) lastAutocastVarp = currentVarp;
+    }
 
-        Player localPlayer = client.getLocalPlayer();
-        int x = 0, y = 0, plane = 0, regionId = 0;
-        if (localPlayer != null) {
-            WorldPoint wp = localPlayer.getWorldLocation();
-            x = wp.getX();
-            y = wp.getY();
-            plane = wp.getPlane();
-            regionId = wp.getRegionID();
+    // --- HELPER METHODS ---
+    private void checkQuestProgress() {
+        if (questSyncTicks > 0) {
+            questSyncTicks--;
+            if (questSyncTicks == 0) seedQuestMap();
+            return;
         }
 
-        GameEvent record = GameEvent.builder()
-                .sessionId(sessionId)
-                .eventType("RANGED_FIRE")
-                .category("Combat")
-                .source(lockedCombatTarget != null && !lockedCombatTarget.isEmpty() ? lockedCombatTarget : "Enemy")
-                .target(lockedCombatTarget != null && !lockedCombatTarget.isEmpty() ? lockedCombatTarget : "Enemy")
-                .skill("Ranged")
-                .x(x)
-                .y(y)
-                .plane(plane)
-                .regionId(regionId)
-                .items(eventItems)
-                .build();
+        for (Quest quest : Quest.values()) {
+            QuestState currentState = quest.getState(client);
+            QuestState previousState = questStates.get(quest);
+            String questName = quest.getName();
 
-        executor.execute(() -> lootWriter.queueRecord(record));
-    }
-
-    private void logAmmoPickup(int itemId, int qty) {
-        String name = itemManager.getItemComposition(itemId).getName();
-        List<DroppedItem> eventItems = List.of(new DroppedItem(
-                itemId, name, qty,
-                (itemManager.getItemPrice(itemId) * qty),
-                (itemManager.getItemComposition(itemId).getHaPrice() * qty),
-                (itemManager.getItemComposition(itemId).getPrice() * qty)
-        ));
-
-        Player localPlayer = client.getLocalPlayer();
-        int x = 0, y = 0, plane = 0, regionId = 0;
-        if (localPlayer != null) {
-            WorldPoint wp = localPlayer.getWorldLocation();
-            x = wp.getX();
-            y = wp.getY();
-            plane = wp.getPlane();
-            regionId = wp.getRegionID();
-        }
-
-        GameEvent record = GameEvent.builder()
-                .sessionId(sessionId)
-                .eventType("TAKE")
-                .category("Misc")
-                .source("Pickup")
-                .target("None")
-                .skill("Ranged")
-                .x(x)
-                .y(y)
-                .plane(plane)
-                .regionId(regionId)
-                .items(eventItems)
-                .build();
-
-        executor.execute(() -> lootWriter.queueRecord(record));
-    }
-
-    @Subscribe    public void onItemContainerChanged(ItemContainerChanged event) {
-        if (event.getContainerId() == InventoryID.INVENTORY.getId()) {
-            ItemContainer container = event.getItemContainer();
-            Item[] currentItems = container.getItems();
-
-            List<DroppedItem> gainedItems = new ArrayList<>();
-            List<DroppedItem> lostItems = new ArrayList<>(); // Track what we spent
-
-            Map<Integer, Integer> currentCounts = new HashMap<>();
-            for (Item item : currentItems) {
-                if (item.getId() != -1) {
-                    currentCounts.put(item.getId(), currentCounts.getOrDefault(item.getId(), 0) + item.getQuantity());
+            if (currentState == QuestState.IN_PROGRESS) {
+                int ticks = activeQuestTicks.getOrDefault(questName, -1);
+                if (ticks == -1) {
+                    try {
+                        String saved = configManager.getConfiguration("lootlogger", "qticks_" + quest.getId());
+                        ticks = saved != null ? Integer.parseInt(saved) : 0;
+                    } catch (Exception e) { ticks = 0; }
                 }
+                ticks++;
+                activeQuestTicks.put(questName, ticks);
+                if (ticks % 100 == 0) configManager.setConfiguration("lootlogger", "qticks_" + quest.getId(), ticks);
             }
 
-            Map<Integer, Integer> previousCounts = new HashMap<>();
-            for (Item item : previousInventory) {
-                if (item.getId() != -1) {
-                    previousCounts.put(item.getId(), previousCounts.getOrDefault(item.getId(), 0) + item.getQuantity());
+            if (previousState != null && currentState != previousState) {
+                questStates.put(quest, currentState);
+                if (currentState == QuestState.IN_PROGRESS || currentState == QuestState.FINISHED) {
+                    if (currentState == QuestState.FINISHED) lastFinishedQuest = questName;
+                    int finalTicks = activeQuestTicks.getOrDefault(questName, 0);
+                    queueEvent("QUEST_PROGRESS", "Quests", questName, "None", new ArrayList<>(), 0, "In-Game Ticks: " + finalTicks);
                 }
-            }
-
-            // --- Detect Gained Items ---
-            for (Map.Entry<Integer, Integer> entry : currentCounts.entrySet()) {
-                int id = entry.getKey();
-                int qty = entry.getValue();
-                int prevQty = previousCounts.getOrDefault(id, 0);
-                if (qty > prevQty) {
-                    int diff = qty - prevQty;
-                    DroppedItem item = createDroppedItem(id, diff);
-                    gainedItems.add(item);
-                    tickGainedItems.add(item); // NEW: Push to tick memory
-                }
-            }
-
-            // --- Detect Lost Items ---
-            for (Map.Entry<Integer, Integer> entry : previousCounts.entrySet()) {
-                int id = entry.getKey();
-                int prevQty = entry.getValue();
-                int currentQty = currentCounts.getOrDefault(id, 0);
-                if (currentQty < prevQty) {
-                    int diff = prevQty - currentQty;
-                    DroppedItem item = createDroppedItem(id, diff);
-                    lostItems.add(item);
-                    tickLostItems.add(item); // NEW: Push to tick memory
-                }
-            }
-
-            // --- UI Check ---
-            boolean isDialogueOpen = false;
-            int[] dialogGroups = {231, 217, 193, 229, 277};
-            for (int groupId : dialogGroups) {
-                Widget w = client.getWidget(groupId, 0);
-                if (w != null && !w.isHidden()) {
-                    isDialogueOpen = true;
-                    break;
-                }
-            }
-
-            // Update memory if dialogue is open right now
-            if (isDialogueOpen) {
-                lastDialogueTick = client.getTickCount();
-            }
-
-            // Did we have a dialogue open within the last 3 ticks? (Protects against spacebar mashing)
-            boolean wasDialogueRecentlyOpen = (client.getTickCount() - lastDialogueTick) <= 3;
-
-            // Check for Shop/Bank/GE
-            boolean isShopInterfaceOpen = (client.getWidget(300, 0) != null && !client.getWidget(300, 0).isHidden());
-            boolean isBankOpen = (client.getWidget(12, 0) != null && !client.getWidget(12, 0).isHidden());
-            boolean isGeOpen = (client.getWidget(465, 0) != null && !client.getWidget(465, 0).isHidden());
-
-            // Use the memory check instead of the strict real-time check
-            if ((wasDialogueRecentlyOpen || isShopInterfaceOpen) && !isBankOpen && !isGeOpen && !gainedItems.isEmpty()) {
-
-                String eventType = isShopInterfaceOpen ? "SHOP_TRANSACTION" : "DIALOGUE_REWARD";
-
-                // If the Quest complete scroll was open recently, it's a quest reward
-                boolean isQuestReward = (client.getWidget(277, 0) != null && !client.getWidget(277, 0).isHidden())
-                        || (lastFinishedQuest != null && !lastFinishedQuest.equals("Quest Reward"));
-
-                String category = isShopInterfaceOpen ? "Shopping" : (isQuestReward ? "Quests" : "NPC Interaction");
-                String source = isShopInterfaceOpen ? currentShopName : (category.equals("Quests") ? lastFinishedQuest : lastDialogueNpc);
-
-                log.info("[LL Debug] {} detected from {}", eventType, source);
-                gameMsg("[LL Debug] Logged " + eventType + " from " + source);
-
-                Player localPlayer = client.getLocalPlayer();
-                WorldPoint wp = localPlayer.getWorldLocation();
-
-                GameEvent transaction = GameEvent.builder()
-                        .sessionId(sessionId)
-                        .eventType(eventType)
-                        .category(category)
-                        .source(source)
-                        .target("None")
-                        .skill("None")
-                        .x(wp.getX()).y(wp.getY()).plane(wp.getPlane()).regionId(wp.getRegionID())
-                        .items(gainedItems)
-                        .note("Spent: " + formatLostItems(lostItems))
-                        .build();
-
-                executor.execute(() -> lootWriter.queueRecord(transaction));
-            }
-
-            // --- NEW: CONSUME TRACKING FIX ---
-            String lastOpt = lastMenuOptionClicked != null ? lastMenuOptionClicked.toLowerCase() : "";
-
-            if ((lastOpt.equals("eat") || lastOpt.equals("drink")) && !lostItems.isEmpty()) {
-                // Calculate exactly how much HP this piece of food gave us
-                int currentHp = client.getBoostedSkillLevel(Skill.HITPOINTS);
-                int hpHealed = Math.max(0, currentHp - previousBoostedHp);
-
-                // Update tracker so we don't double count if we eat 2 things fast
-                previousBoostedHp = currentHp;
-
-                Player localPlayer = client.getLocalPlayer();
-                WorldPoint wp = localPlayer != null ? localPlayer.getWorldLocation() : new WorldPoint(0,0,0);
-
-                for (DroppedItem lostItem : lostItems) {
-                    GameEvent consumeEvent = GameEvent.builder()
-                            .sessionId(sessionId)
-                            .eventType("CONSUME")
-                            .category("Combat") // Ensures it hits your Combat Costs page!
-                            .source("Activity")
-                            .target("None")
-                            .skill("Hitpoints")
-                            .x(wp.getX()).y(wp.getY()).plane(wp.getPlane()).regionId(wp.getRegionID())
-                            .items(List.of(lostItem))
-                            .hpHealed(hpHealed)
-                            .build();
-
-                    executor.execute(() -> lootWriter.queueRecord(consumeEvent));
-                }
-            }
-
-            // Wipe the memory so passive inventory shifts don't trigger eating
-            lastMenuOptionClicked = "";
-
-            // Save state for next check (This is already in your code!)
-            for (int i = 0; i < 28; i++) {
-                previousInventory[i] = i < currentItems.length ? currentItems[i] : new Item(-1, 0);
             }
         }
     }
 
-
-    // Helper to clean up the code
     private DroppedItem createDroppedItem(int id, int qty) {
-        String name = itemManager.getItemComposition(id).getName();
+        ItemComposition comp = itemManager.getItemComposition(id);
+        String name = comp != null ? comp.getName() : "Unknown";
         int ge = itemManager.getItemPrice(id) * qty;
-        int ha = itemManager.getItemComposition(id).getHaPrice() * qty;
-        int base = itemManager.getItemComposition(id).getPrice() * qty;
+        int ha = comp != null ? comp.getHaPrice() * qty : 0;
+        int base = comp != null ? comp.getPrice() * qty : 0;
         return new DroppedItem(id, name, qty, ge, ha, base);
     }
 
     private String formatLostItems(List<DroppedItem> lost) {
         if (lost.isEmpty()) return "Nothing";
         StringBuilder sb = new StringBuilder();
-        for (DroppedItem i : lost) {
-            sb.append(i.getQty()).append("x ").append(i.getName()).append(" ");
-        }
+        for (DroppedItem i : lost) sb.append(i.getQty()).append("x ").append(i.getName()).append(" ");
         return sb.toString().trim();
     }
 
-    private void sendXpRecord(String skillName, int xp) {
-        WorldPoint wp = client.getLocalPlayer().getWorldLocation();
-        GameEvent record = GameEvent.builder()
-                .sessionId(sessionId)
-                .eventType("XP_GAIN")
-                .category("Combat")
-                .source("Activity")
-                .skill(skillName)
-                .x(wp.getX()).y(wp.getY()).plane(wp.getPlane())
-                .items(List.of(new DroppedItem(0, skillName, xp, 0, 0, 0)))
-                .build();
-        executor.execute(() -> lootWriter.queueRecord(record));
+    private String getActiveShopName() {
+        int[] primaryLocations = {1, 2, 78};
+        for (int id : primaryLocations) {
+            Widget w = client.getWidget(300, id);
+            if (w != null && w.getText() != null && !w.getText().isEmpty()) {
+                String clean = Text.removeTags(w.getText()).trim();
+                if (clean.length() > 3 && !clean.equalsIgnoreCase("Close") && !clean.contains("Value check")) return clean;
+            }
+        }
+        return lockedShopTarget.trim().isEmpty() ? "Unknown Shop" : lockedShopTarget + (lockedShopTarget.toLowerCase().contains("shop") ? "" : " Shop");
+    }
+
+    private List<DroppedItem> getShopItems() {
+        List<DroppedItem> stockItems = new ArrayList<>();
+        Widget itemGrid = client.getWidget(300, 16);
+        if (itemGrid != null && itemGrid.getChildren() != null) {
+            for (Widget itemWidget : itemGrid.getChildren()) {
+                if (itemWidget.getItemId() > 0) {
+                    int canonicalId = itemManager.canonicalize(itemWidget.getItemId());
+                    stockItems.add(createDroppedItem(canonicalId, itemWidget.getItemQuantity()));
+                }
+            }
+        }
+        return stockItems;
+    }
+
+    private List<String> extractAllText(Widget w) {
+        List<String> texts = new ArrayList<>();
+        if (w == null) return texts;
+        if (w.getText() != null && !w.getText().trim().isEmpty()) {
+            String clean = Text.removeTags(w.getText()).trim();
+            if (!clean.isEmpty()) texts.add(clean);
+        }
+        if (w.getDynamicChildren() != null) for (Widget child : w.getDynamicChildren()) texts.addAll(extractAllText(child));
+        if (w.getStaticChildren() != null) for (Widget child : w.getStaticChildren()) texts.addAll(extractAllText(child));
+        if (w.getNestedChildren() != null) for (Widget child : w.getNestedChildren()) texts.addAll(extractAllText(child));
+        return texts;
+    }
+
+    private String getStandardAutocastSpell(int varp) {
+        switch (varp) {
+            case 3: return "Wind Strike"; case 5: return "Water Strike"; case 7: return "Earth Strike"; case 9: return "Fire Strike";
+            case 11: return "Wind Bolt"; case 13: return "Water Bolt"; case 15: return "Earth Bolt"; case 17: return "Fire Bolt";
+            case 19: return "Wind Blast"; case 21: return "Water Blast"; case 23: return "Earth Blast"; case 25: return "Fire Blast";
+            case 27: return "Wind Wave"; case 29: return "Water Wave"; case 31: return "Earth Wave"; case 33: return "Fire Wave";
+            case 35: return "Wind Surge"; case 37: return "Water Surge"; case 39: return "Earth Surge"; case 41: return "Fire Surge";
+            default: return "Unknown Autocast (" + varp + ")";
+        }
     }
 }
