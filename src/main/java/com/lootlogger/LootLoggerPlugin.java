@@ -636,8 +636,15 @@ public class LootLoggerPlugin extends Plugin {
                     targetSource = tickLostItems.get(0).getName();
                 }
                 // 4. Inventory Diff Check: Did we gain a resource? (Thieving, Mining empty-handed)
+                // Replace the block above with this:
                 else if (!tickGainedItems.isEmpty()) {
-                    targetSource = tickGainedItems.get(0).getName();
+                    // Only use the item as a source if it's NOT a generic inventory key/misc item
+                    String itemName = tickGainedItems.get(0).getName().toLowerCase();
+                    if (itemName.contains("key") || itemName.contains("bone")) {
+                        targetSource = "Activity"; // Force fallback to avoid "Key" or "Bones" as a skill source
+                    } else {
+                        targetSource = tickGainedItems.get(0).getName();
+                    }
                 }
                 // 5. Absolute Fallback
                 else {
@@ -832,8 +839,7 @@ public class LootLoggerPlugin extends Plugin {
         executor.execute(() -> lootWriter.queueRecord(record));
     }
 
-    @Subscribe
-    public void onItemContainerChanged(ItemContainerChanged event) {
+    @Subscribe    public void onItemContainerChanged(ItemContainerChanged event) {
         if (event.getContainerId() == InventoryID.INVENTORY.getId()) {
             ItemContainer container = event.getItemContainer();
             Item[] currentItems = container.getItems();
@@ -938,12 +944,47 @@ public class LootLoggerPlugin extends Plugin {
                 executor.execute(() -> lootWriter.queueRecord(transaction));
             }
 
-            // Save state for next check
+            // --- NEW: CONSUME TRACKING FIX ---
+            String lastOpt = lastMenuOptionClicked != null ? lastMenuOptionClicked.toLowerCase() : "";
+
+            if ((lastOpt.equals("eat") || lastOpt.equals("drink")) && !lostItems.isEmpty()) {
+                // Calculate exactly how much HP this piece of food gave us
+                int currentHp = client.getBoostedSkillLevel(Skill.HITPOINTS);
+                int hpHealed = Math.max(0, currentHp - previousBoostedHp);
+
+                // Update tracker so we don't double count if we eat 2 things fast
+                previousBoostedHp = currentHp;
+
+                Player localPlayer = client.getLocalPlayer();
+                WorldPoint wp = localPlayer != null ? localPlayer.getWorldLocation() : new WorldPoint(0,0,0);
+
+                for (DroppedItem lostItem : lostItems) {
+                    GameEvent consumeEvent = GameEvent.builder()
+                            .sessionId(sessionId)
+                            .eventType("CONSUME")
+                            .category("Combat") // Ensures it hits your Combat Costs page!
+                            .source("Activity")
+                            .target("None")
+                            .skill("Hitpoints")
+                            .x(wp.getX()).y(wp.getY()).plane(wp.getPlane()).regionId(wp.getRegionID())
+                            .items(List.of(lostItem))
+                            .hpHealed(hpHealed)
+                            .build();
+
+                    executor.execute(() -> lootWriter.queueRecord(consumeEvent));
+                }
+            }
+
+            // Wipe the memory so passive inventory shifts don't trigger eating
+            lastMenuOptionClicked = "";
+
+            // Save state for next check (This is already in your code!)
             for (int i = 0; i < 28; i++) {
                 previousInventory[i] = i < currentItems.length ? currentItems[i] : new Item(-1, 0);
             }
         }
     }
+
 
     // Helper to clean up the code
     private DroppedItem createDroppedItem(int id, int qty) {
