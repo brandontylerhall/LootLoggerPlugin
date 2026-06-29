@@ -75,6 +75,8 @@ public class LootLoggerPlugin extends Plugin {
     // --- WIDGET EDGE TRACKING ---
     private boolean prevShopOpen = false;
     private boolean prevExamineOpen = false;
+    private boolean bankSnapshotTaken = false;
+    private boolean prevBankOpen = false;
 
     // -------------------------------------------------------------------------
     // Lifecycle
@@ -82,6 +84,8 @@ public class LootLoggerPlugin extends Plugin {
 
     @Override
     protected void startUp() throws Exception {
+        bankSnapshotTaken = false;
+        prevBankOpen = false;
         sessionId = java.util.UUID.randomUUID().toString();
         lootWriter = new LootWriter();
         lootWriter.init();
@@ -119,6 +123,8 @@ public class LootLoggerPlugin extends Plugin {
     @Subscribe
     public void onGameStateChanged(GameStateChanged event) {
         if (event.getGameState() == GameState.LOGGED_IN) {
+            bankSnapshotTaken = false;
+            prevBankOpen = false;
             seedQuestMap();
             questSyncTicks = 3;
             // Force snapshots so the server can calibrate its state on login.
@@ -193,6 +199,7 @@ public class LootLoggerPlugin extends Plugin {
 
         // --- Shop open edge: emit SHOP_STOCK when shop widget just opened ---
         handleShopEdge(tick.widgets.shop);
+        handleBankEdge(tick.widgets.bank);
 
         // --- Monster examine open edge: emit EXAMINE_TEXT ---
         handleExamineEdge();
@@ -281,6 +288,20 @@ public class LootLoggerPlugin extends Plugin {
             emit("SHOP_STOCK", payload);
         }
         prevShopOpen = shopOpen;
+    }
+
+    private void handleBankEdge(boolean bankOpen) {
+        if (bankOpen && !prevBankOpen && !bankSnapshotTaken) {
+            BankSnapshotPayload payload = new BankSnapshotPayload();
+            payload.items = snapshotContainer(InventoryID.BANK);
+            emit("BANK_SNAPSHOT", payload);
+            bankSnapshotTaken = true;
+        }
+        prevBankOpen = bankOpen;
+    }
+
+    public static class BankSnapshotPayload {
+        public List<RawItem> items;
     }
 
     /**
@@ -380,9 +401,20 @@ public class LootLoggerPlugin extends Plugin {
         int[] slots = {1, 2, 78};
         for (int slot : slots) {
             Widget w = client.getWidget(300, slot);
-            if (w != null && w.getText() != null && !w.getText().isEmpty()) {
-                String clean = Text.removeTags(w.getText()).trim();
-                if (!clean.isEmpty()) candidates.add(clean);
+            if (w == null) continue;
+
+            // Check the widget itself
+            if (w.getText() != null && !w.getText().isEmpty()) {
+                candidates.add(w.getText());
+            }
+
+            // Check its children — the title is likely here
+            if (w.getChildren() != null) {
+                for (Widget child : w.getChildren()) {
+                    if (child != null && child.getText() != null && !child.getText().isEmpty()) {
+                        candidates.add(child.getText());
+                    }
+                }
             }
         }
         return candidates;
