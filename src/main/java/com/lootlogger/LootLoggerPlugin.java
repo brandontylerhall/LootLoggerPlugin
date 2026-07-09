@@ -4,12 +4,15 @@ import com.google.inject.Provides;
 import com.lootlogger.data.RawEvent;
 import com.lootlogger.data.RawItem;
 import com.lootlogger.io.LootWriter;
+import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.*;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.*;
 import net.runelite.api.widgets.Widget;
+import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
+import net.runelite.client.events.ConfigChanged;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.game.ItemManager;
 import net.runelite.client.plugins.Plugin;
@@ -24,30 +27,38 @@ import java.util.*;
 
 /**
  * "Dumb client" version of the Loot Logger plugin.
- *
+ * <p>
  * All intent-inference (Net-Diff, context-locking, XP attribution, quest state
  * machine) has been moved to the Next.js backend. This plugin collects raw game
  * signals and ships them as typed RawEvent messages to /api/ingest via LootWriter.
- *
- * Wire format — seven event types:
- *   TICK         — per-tick context: HP, widget flags, autocast varp, quest-points,
- *                  last menu option + inv/equip snapshots (only on dirty ticks).
- *   MENU_CLICK   — raw option + target string on every MenuOptionClicked.
- *   XP_UPDATE    — absolute XP per skill on every StatChanged.
- *   NPC_LOOT     — loot items on NpcLootReceived.
- *   SHOP_STOCK   — shop inventory when the shop widget first opens.
- *   EXAMINE_TEXT — raw widget-522 text when monster examine opens.
- *   QUEST_STATE  — quest id/name/newState on every QuestState change.
+ * <p>
+ * Wire format — eight event types:
+ * TICK           — per-tick context: HP, widget flags, autocast varp, quest-points,
+ * last menu option + inv/equip snapshots (only on dirty ticks).
+ * MENU_CLICK     — raw option + target string on every MenuOptionClicked.
+ * XP_UPDATE      — absolute XP per skill on every StatChanged.
+ * NPC_LOOT       — loot items on NpcLootReceived.
+ * SHOP_STOCK     — shop inventory when the shop widget first opens.
+ * EXAMINE_TEXT   — raw widget-522 text when monster examine opens.
+ * QUEST_STATE    — quest id/name/newState on every QuestState change.
+ * STATS_SNAPSHOT — real skill levels + total/combat level on login and every 10 min.
  */
 @Slf4j
 @PluginDescriptor(name = "Loot to JSON")
 public class LootLoggerPlugin extends Plugin {
 
-    @Inject private Client client;
-    @Inject private LootLoggerConfig config;
-    @Inject private ItemManager itemManager;
-    @Inject private ConfigManager configManager;
-    @Inject private java.util.concurrent.ScheduledExecutorService executor;
+    @Inject
+    private Client client;
+    @Inject
+    private ClientThread clientThread;
+    @Inject
+    private LootLoggerConfig config;
+    @Inject
+    private ItemManager itemManager;
+    @Inject
+    private ConfigManager configManager;
+    @Inject
+    private java.util.concurrent.ScheduledExecutorService executor;
 
     @Provides
     LootLoggerConfig provideConfig(ConfigManager configManager) {
@@ -75,8 +86,6 @@ public class LootLoggerPlugin extends Plugin {
     // --- WIDGET EDGE TRACKING ---
     private boolean prevShopOpen = false;
     private boolean prevExamineOpen = false;
-    private boolean bankSnapshotTaken = false;
-    private boolean prevBankOpen = false;
 
     // -------------------------------------------------------------------------
     // Lifecycle
@@ -84,10 +93,9 @@ public class LootLoggerPlugin extends Plugin {
 
     @Override
     protected void startUp() throws Exception {
-        bankSnapshotTaken = false;
-        prevBankOpen = false;
         sessionId = java.util.UUID.randomUUID().toString();
         lootWriter = new LootWriter();
+        lootWriter.configure(config.backendUrl(), config.apiKey());
         lootWriter.init();
 
         // Force a full snapshot on the very first post-login tick.
@@ -100,7 +108,9 @@ public class LootLoggerPlugin extends Plugin {
             seedQuestMap();
             questSyncTicks = 3;
         }
-        log.info("[LL] Plugin started. Session: {}", sessionId);
+        log.info("[LL] Startup: session={}, gameState={}, endpoint={}/api/ingest, apiKeySet={}",
+                sessionId, client.getGameState(), config.backendUrl(),
+                config.apiKey() != null && !config.apiKey().isBlank());
     }
 
     @Override
@@ -111,9 +121,29 @@ public class LootLoggerPlugin extends Plugin {
         }
     }
 
+    @Subscribe
+    public void onConfigChanged(ConfigChanged event) {
+        if (event.getGroup().equals("lootlogger") && lootWriter != null) {
+            lootWriter.configure(config.backendUrl(), config.apiKey());
+        }
+    }
+
     @Schedule(period = 10, unit = ChronoUnit.SECONDS, asynchronous = true)
     public void submitBatch() {
         if (lootWriter != null) lootWriter.flush();
+    }
+
+    /**
+     * Periodic STATS_SNAPSHOT. @Schedule runs off the client thread, so the
+     * client reads are marshalled back onto it via ClientThread.
+     */
+    @Schedule(period = 10, unit = ChronoUnit.MINUTES, asynchronous = true)
+    public void submitStatsSnapshot() {
+        clientThread.invoke(() -> {
+            if (client.getGameState() == GameState.LOGGED_IN) {
+                emitStatsSnapshot();
+            }
+        });
     }
 
     // -------------------------------------------------------------------------
@@ -123,8 +153,6 @@ public class LootLoggerPlugin extends Plugin {
     @Subscribe
     public void onGameStateChanged(GameStateChanged event) {
         if (event.getGameState() == GameState.LOGGED_IN) {
-            bankSnapshotTaken = false;
-            prevBankOpen = false;
             seedQuestMap();
             questSyncTicks = 3;
             // Force snapshots so the server can calibrate its state on login.
@@ -132,6 +160,7 @@ public class LootLoggerPlugin extends Plugin {
             equipDirty = true;
             prevShopOpen = false;
             prevExamineOpen = false;
+            emitStatsSnapshot();
         }
     }
 
@@ -173,10 +202,10 @@ public class LootLoggerPlugin extends Plugin {
         }
 
         tick.widgets = new WidgetFlags();
-        tick.widgets.bank       = isWidgetVisible(12, 0);
-        tick.widgets.ge         = isWidgetVisible(465, 0);
-        tick.widgets.deposit    = isWidgetVisible(192, 0);
-        tick.widgets.shop       = isWidgetVisible(300, 0);
+        tick.widgets.bank = isWidgetVisible(12, 0);
+        tick.widgets.ge = isWidgetVisible(465, 0);
+        tick.widgets.deposit = isWidgetVisible(192, 0);
+        tick.widgets.shop = isWidgetVisible(300, 0);
         tick.widgets.dialogue231 = isWidgetVisible(231, 0);
         tick.widgets.dialogue217 = isWidgetVisible(217, 0);
         tick.widgets.dialogue193 = isWidgetVisible(193, 0);
@@ -199,13 +228,14 @@ public class LootLoggerPlugin extends Plugin {
 
         // --- Shop open edge: emit SHOP_STOCK when shop widget just opened ---
         handleShopEdge(tick.widgets.shop);
-        handleBankEdge(tick.widgets.bank);
 
         // --- Monster examine open edge: emit EXAMINE_TEXT ---
         handleExamineEdge();
     }
 
-    /** Ships raw option + target strings. Server strips tags and runs context-locking. */
+    /**
+     * Ships raw option + target strings. Server strips tags and runs context-locking.
+     */
     @Subscribe
     public void onMenuOptionClicked(MenuOptionClicked event) {
         lastMenuOptionRaw = event.getMenuOption();
@@ -217,7 +247,9 @@ public class LootLoggerPlugin extends Plugin {
         emit("MENU_CLICK", payload);
     }
 
-    /** Ships absolute XP value. Server computes delta and resolves source. */
+    /**
+     * Ships absolute XP value. Server computes delta and resolves source.
+     */
     @Subscribe
     public void onStatChanged(StatChanged event) {
         XpUpdatePayload payload = new XpUpdatePayload();
@@ -226,7 +258,9 @@ public class LootLoggerPlugin extends Plugin {
         emit("XP_UPDATE", payload);
     }
 
-    /** Ships enriched loot items. Server emits NPC_DROP. */
+    /**
+     * Ships enriched loot items. Server emits NPC_DROP.
+     */
     @Subscribe
     public void onNpcLootReceived(NpcLootReceived event) {
         NpcLootPayload payload = new NpcLootPayload();
@@ -290,20 +324,6 @@ public class LootLoggerPlugin extends Plugin {
         prevShopOpen = shopOpen;
     }
 
-    private void handleBankEdge(boolean bankOpen) {
-        if (bankOpen && !prevBankOpen && !bankSnapshotTaken) {
-            BankSnapshotPayload payload = new BankSnapshotPayload();
-            payload.items = snapshotContainer(InventoryID.BANK);
-            emit("BANK_SNAPSHOT", payload);
-            bankSnapshotTaken = true;
-        }
-        prevBankOpen = bankOpen;
-    }
-
-    public static class BankSnapshotPayload {
-        public List<RawItem> items;
-    }
-
     /**
      * Emits EXAMINE_TEXT on the tick the monster-examine widget (522) first opens.
      * Only emits when the text contains actual stat data (aggressive/defensive/hitpoints).
@@ -333,7 +353,29 @@ public class LootLoggerPlugin extends Plugin {
         prevExamineOpen = examineOpen;
     }
 
-    /** Stamps world coords, wraps payload in RawEvent, hands off to LootWriter asynchronously. */
+    /**
+     * Emits a STATS_SNAPSHOT with real (unboosted) levels for every skill.
+     * Must run on the client thread.
+     */
+    private void emitStatsSnapshot() {
+        Player localPlayer = client.getLocalPlayer();
+        if (localPlayer == null) return;
+
+        Map<String, Integer> skillLevels = new LinkedHashMap<>();
+        for (Skill skill : Skill.values()) {
+            skillLevels.put(skill.getName(), client.getRealSkillLevel(skill));
+        }
+
+        StatsSnapshotPayload payload = new StatsSnapshotPayload();
+        payload.setSkillLevels(skillLevels);
+        payload.setTotalLevel(client.getTotalLevel());
+        payload.setCombatLevel(localPlayer.getCombatLevel());
+        emit("STATS_SNAPSHOT", payload);
+    }
+
+    /**
+     * Stamps world coords, wraps payload in RawEvent, hands off to LootWriter asynchronously.
+     */
     private void emit(String type, Object payload) {
         Player localPlayer = client.getLocalPlayer();
         int x = 0, y = 0, plane = 0, regionId = 0;
@@ -356,7 +398,9 @@ public class LootLoggerPlugin extends Plugin {
         executor.execute(() -> lootWriter.queueRecord(event));
     }
 
-    /** Returns a full item list for the given container; null-safe. */
+    /**
+     * Returns a full item list for the given container; null-safe.
+     */
     private List<RawItem> snapshotContainer(InventoryID containerId) {
         List<RawItem> items = new ArrayList<>();
         ItemContainer container = client.getItemContainer(containerId);
@@ -401,26 +445,17 @@ public class LootLoggerPlugin extends Plugin {
         int[] slots = {1, 2, 78};
         for (int slot : slots) {
             Widget w = client.getWidget(300, slot);
-            if (w == null) continue;
-
-            // Check the widget itself
-            if (w.getText() != null && !w.getText().isEmpty()) {
-                candidates.add(w.getText());
-            }
-
-            // Check its children — the title is likely here
-            if (w.getChildren() != null) {
-                for (Widget child : w.getChildren()) {
-                    if (child != null && child.getText() != null && !child.getText().isEmpty()) {
-                        candidates.add(child.getText());
-                    }
-                }
+            if (w != null && w.getText() != null && !w.getText().isEmpty()) {
+                String clean = Text.removeTags(w.getText()).trim();
+                if (!clean.isEmpty()) candidates.add(clean);
             }
         }
         return candidates;
     }
 
-    /** Reads enriched items from the shop item grid (300, 16). */
+    /**
+     * Reads enriched items from the shop item grid (300, 16).
+     */
     private List<RawItem> getShopItems() {
         List<RawItem> stockItems = new ArrayList<>();
         Widget itemGrid = client.getWidget(300, 16);
@@ -435,7 +470,9 @@ public class LootLoggerPlugin extends Plugin {
         return stockItems;
     }
 
-    /** Recursively scrapes all non-empty text from a widget and its children. */
+    /**
+     * Recursively scrapes all non-empty text from a widget and its children.
+     */
     private List<String> extractAllText(Widget w) {
         List<String> texts = new ArrayList<>();
         if (w == null) return texts;
@@ -443,9 +480,12 @@ public class LootLoggerPlugin extends Plugin {
             String clean = Text.removeTags(w.getText()).trim();
             if (!clean.isEmpty()) texts.add(clean);
         }
-        if (w.getDynamicChildren() != null) for (Widget child : w.getDynamicChildren()) texts.addAll(extractAllText(child));
-        if (w.getStaticChildren() != null)  for (Widget child : w.getStaticChildren())  texts.addAll(extractAllText(child));
-        if (w.getNestedChildren() != null)  for (Widget child : w.getNestedChildren())  texts.addAll(extractAllText(child));
+        if (w.getDynamicChildren() != null)
+            for (Widget child : w.getDynamicChildren()) texts.addAll(extractAllText(child));
+        if (w.getStaticChildren() != null)
+            for (Widget child : w.getStaticChildren()) texts.addAll(extractAllText(child));
+        if (w.getNestedChildren() != null)
+            for (Widget child : w.getNestedChildren()) texts.addAll(extractAllText(child));
         return texts;
     }
 
@@ -459,7 +499,9 @@ public class LootLoggerPlugin extends Plugin {
     // The server uses the `type` discriminator to deserialise to the correct type.
     // =========================================================================
 
-    /** Emitted every GameTick. Heavy inv/equip arrays only present on dirty ticks. */
+    /**
+     * Emitted every GameTick. Heavy inv/equip arrays only present on dirty ticks.
+     */
     public static class TickPayload {
         public int hp;
         public int questPoints;
@@ -472,7 +514,9 @@ public class LootLoggerPlugin extends Plugin {
         public List<RawItem> equip;      // null when equipment unchanged since last snapshot
     }
 
-    /** Open/hidden state of the widgets the server needs for Net-Diff classification. */
+    /**
+     * Open/hidden state of the widgets the server needs for Net-Diff classification.
+     */
     public static class WidgetFlags {
         public boolean bank;        // widget(12,0)  — suppress net-diff
         public boolean ge;          // widget(465,0) — suppress net-diff
@@ -485,19 +529,25 @@ public class LootLoggerPlugin extends Plugin {
         public boolean dialogue277; // Quest complete — quest reward items
     }
 
-    /** Emitted on every MenuOptionClicked. Raw strings — server strips and locks context. */
+    /**
+     * Emitted on every MenuOptionClicked. Raw strings — server strips and locks context.
+     */
     public static class MenuClickPayload {
         public String option;
         public String target;
     }
 
-    /** Emitted on every StatChanged. Absolute XP — server computes delta and resolves source. */
+    /**
+     * Emitted on every StatChanged. Absolute XP — server computes delta and resolves source.
+     */
     public static class XpUpdatePayload {
         public String skill;
         public int xp;
     }
 
-    /** Emitted on NpcLootReceived. Server emits NPC_DROP classified event. */
+    /**
+     * Emitted on NpcLootReceived. Server emits NPC_DROP classified event.
+     */
     public static class NpcLootPayload {
         public String npcName;
         public int npcLevel;
@@ -507,7 +557,7 @@ public class LootLoggerPlugin extends Plugin {
     /**
      * Emitted when the shop widget (300,0) first opens.
      * shopNameCandidates: raw texts from title widgets (300,{1,2,78}) —
-     *   server applies name-resolution logic + locked-shop-target fallback.
+     * server applies name-resolution logic + locked-shop-target fallback.
      */
     public static class ShopStockPayload {
         public List<String> shopNameCandidates;
@@ -530,5 +580,17 @@ public class LootLoggerPlugin extends Plugin {
         public int questId;
         public String questName;
         public String newState; // "NOT_STARTED" | "IN_PROGRESS" | "FINISHED"
+    }
+
+    /**
+     * Emitted on login and every 10 minutes. Server passes it through as a
+     * classified STATS_SNAPSHOT row; get_stats_at_time() correlates kill
+     * sessions with the player's levels at that moment.
+     */
+    @Data
+    public static class StatsSnapshotPayload {
+        private Map<String, Integer> skillLevels; // skill name → real (unboosted) level
+        private int totalLevel;
+        private int combatLevel;
     }
 }

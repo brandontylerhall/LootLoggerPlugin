@@ -9,13 +9,14 @@ import java.time.Instant;
  * The new "dumb client" wire envelope.
  *
  * type discriminator → payload shape:
- *   TICK          → LootLoggerPlugin.TickPayload
- *   MENU_CLICK    → LootLoggerPlugin.MenuClickPayload
- *   XP_UPDATE     → LootLoggerPlugin.XpUpdatePayload
- *   NPC_LOOT      → LootLoggerPlugin.NpcLootPayload
- *   SHOP_STOCK    → LootLoggerPlugin.ShopStockPayload
- *   EXAMINE_TEXT  → LootLoggerPlugin.ExamineTextPayload
- *   QUEST_STATE   → LootLoggerPlugin.QuestStatePayload
+ *   TICK           → LootLoggerPlugin.TickPayload
+ *   MENU_CLICK     → LootLoggerPlugin.MenuClickPayload
+ *   XP_UPDATE      → LootLoggerPlugin.XpUpdatePayload
+ *   NPC_LOOT       → LootLoggerPlugin.NpcLootPayload
+ *   SHOP_STOCK     → LootLoggerPlugin.ShopStockPayload
+ *   EXAMINE_TEXT   → LootLoggerPlugin.ExamineTextPayload
+ *   QUEST_STATE    → LootLoggerPlugin.QuestStatePayload
+ *   STATS_SNAPSHOT → LootLoggerPlugin.StatsSnapshotPayload
  *
  * The server uses sessionId + clientTick to reconstruct tick-ordered
  * streams and replay the Net-Diff / context-locking classifiers.
@@ -34,7 +35,7 @@ public class RawEvent {
     /** client.getTickCount() — primary ordering key for the server's state machine. */
     private long clientTick;
 
-    /** One of: TICK | MENU_CLICK | XP_UPDATE | NPC_LOOT | SHOP_STOCK | EXAMINE_TEXT | QUEST_STATE */
+    /** One of: TICK | MENU_CLICK | XP_UPDATE | NPC_LOOT | SHOP_STOCK | EXAMINE_TEXT | QUEST_STATE | STATS_SNAPSHOT */
     private String type;
 
     // Player world location, stamped on every event.
