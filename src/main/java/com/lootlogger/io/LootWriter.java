@@ -8,6 +8,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.time.Duration;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
@@ -39,7 +40,15 @@ public class LootWriter {
     private volatile String backendUrl;
     private volatile String apiKey;
 
-    private final HttpClient httpClient = HttpClient.newHttpClient();
+    // Pinned to HTTP/1.1: the default client negotiates HTTP/2, which for a
+    // cleartext http:// endpoint sends an "Upgrade: h2c" request. Next.js's
+    // underlying Node HTTP server has no h2c upgrade handler and destroys the
+    // socket without responding, surfacing as
+    // "IOException: HTTP/1.1 header parser received no bytes" on every push.
+    private final HttpClient httpClient = HttpClient.newBuilder()
+            .version(HttpClient.Version.HTTP_1_1)
+            .connectTimeout(Duration.ofSeconds(10))
+            .build();
     private final List<Object> batch = new ArrayList<>();
 
     /**
