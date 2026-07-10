@@ -19,6 +19,8 @@ import java.time.Instant;
  *   STATS_SNAPSHOT → LootLoggerPlugin.StatsSnapshotPayload
  *   BANK_SNAPSHOT  → LootLoggerPlugin.BankSnapshotPayload
  *   QUEST_SNAPSHOT → LootLoggerPlugin.QuestSnapshotPayload
+ *   CHEST_LOOT     → LootLoggerPlugin.ChestLootPayload
+ *   COLLECTION_LOG → LootLoggerPlugin.CollectionLogPayload
  *
  * The server uses sessionId + clientTick to reconstruct tick-ordered
  * streams and replay the Net-Diff / context-locking classifiers.
@@ -37,7 +39,7 @@ public class RawEvent {
     /** client.getTickCount() — primary ordering key for the server's state machine. */
     private long clientTick;
 
-    /** One of: TICK | MENU_CLICK | XP_UPDATE | NPC_LOOT | SHOP_STOCK | EXAMINE_TEXT | QUEST_STATE | STATS_SNAPSHOT | BANK_SNAPSHOT | QUEST_SNAPSHOT */
+    /** One of: TICK | MENU_CLICK | XP_UPDATE | NPC_LOOT | SHOP_STOCK | EXAMINE_TEXT | QUEST_STATE | STATS_SNAPSHOT | BANK_SNAPSHOT | QUEST_SNAPSHOT | CHEST_LOOT | COLLECTION_LOG */
     private String type;
 
     // Player world location, stamped on every event.

@@ -24,6 +24,8 @@ import net.runelite.client.util.Text;
 import javax.inject.Inject;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * "Dumb client" version of the Loot Logger plugin.
@@ -44,6 +46,10 @@ import java.util.*;
  * STATS_SNAPSHOT — real skill levels + total/combat level (+ membership) on login and every 10 min.
  * BANK_SNAPSHOT  — full bank contents whenever the bank container changes while open.
  * QUEST_SNAPSHOT — full quest-state list + quest points once per login (after quest varps settle).
+ * CHEST_LOOT     — interface-delivered rewards (Barrows/CoX/ToB/ToA chests, clue caskets) with
+ *                  items; or an items-empty marker (Wintertodt/Tempoross/GOTR) telling the server
+ *                  to attribute the next inventory gains to the named content.
+ * COLLECTION_LOG — item name whenever a new collection log slot is filled (popup script or chat).
  */
 @Slf4j
 @PluginDescriptor(name = "Loot to JSON")
@@ -88,6 +94,36 @@ public class LootLoggerPlugin extends Plugin {
     // --- WIDGET EDGE TRACKING ---
     private boolean shopCaptured = false; // one SHOP_STOCK per shop visit
     private boolean prevExamineOpen = false;
+
+    // --- CHEST / MINIGAME LOOT (mirrors the official LootTrackerPlugin mechanics) ---
+    // Handled content: Barrows, Chambers of Xeric, Theatre of Blood, Tombs of Amascut,
+    // Clue Scroll caskets (all tiers), Wintertodt supply crate/reward cart,
+    // Tempoross reward pool, Guardians of the Rift, and collection log slots.
+    //
+    // TODO (deferred): the following official-loot-tracker content types are intentionally
+    // NOT handled yet and can be added incrementally using the same CHEST_LOOT event:
+    // HAM chest, Larran's chests, Rogues' chest, shade chests, herbiboar, birdhouses,
+    // pickpockets, seed pack, Kingdom of Miscellania, Fishing Trawler, drift net, LMS,
+    // Soul Wars spoils, Barbarian Assault high gamble, Unsired, Lunar Chest,
+    // Fortis Colosseum, ore/gem/salvage packs, hallowed sack, Doom of Mokhaiotl,
+    // and item-triggered caskets/bird nests.
+    private static final Pattern CLUE_SCROLL_PATTERN =
+            Pattern.compile("You have completed [0-9]+ ([a-z]+) Treasure Trails?\\.");
+    private static final Pattern COLLECTION_LOG_CHAT_PATTERN =
+            Pattern.compile("New item added to your collection log: (.*)");
+    private static final String MINIGAME_LOOT_STRING = "You found some loot: ";
+    private static final String COLLECTION_POPUP_PREFIX = "New item:";
+    private static final int THEATRE_OF_BLOOD_REGION = 12867;
+    private static final int WINTERTODT_REGION = 6461;
+    private static final int TEMPOROSS_REGION = 12588;
+    private static final int GUARDIANS_OF_THE_RIFT_REGION = 14484;
+    private static final int CLUE_PENDING_TIMEOUT_TICKS = 10; // mirrors official INVCHANGE_TIMEOUT
+
+    private boolean chestLooted = false;              // one reward chest per raid instance
+    private boolean lastLoadingIntoInstance = false;  // chestLooted resets when this flips on LOADING
+    private String pendingClueTier = null;            // set by clue chat msg; consumed by TRAIL_REWARDINV change
+    private int pendingClueTick = -1;
+    private boolean collectionPopupStarted = false;   // NOTIFICATION_START seen, awaiting NOTIFICATION_DELAY
 
     // -------------------------------------------------------------------------
     // Lifecycle
@@ -154,6 +190,16 @@ public class LootLoggerPlugin extends Plugin {
 
     @Subscribe
     public void onGameStateChanged(GameStateChanged event) {
+        // Raid chest latch resets when loading into/out of an instance
+        // (same mechanic as the official loot tracker).
+        if (event.getGameState() == GameState.LOADING) {
+            boolean inInstance = client.isInInstancedRegion();
+            if (inInstance != lastLoadingIntoInstance) {
+                lastLoadingIntoInstance = inInstance;
+                chestLooted = false;
+            }
+        }
+
         if (event.getGameState() == GameState.LOGGED_IN) {
             seedQuestMap();
             questSyncTicks = 3;
@@ -181,6 +227,16 @@ public class LootLoggerPlugin extends Plugin {
             // The BANK container populates/changes only while the bank is open —
             // the reliable point to capture a full snapshot.
             emitBankSnapshot();
+        } else if (id == net.runelite.api.gameval.InventoryID.TRAIL_REWARDINV) {
+            // Clue casket rewards land in the shared trail-reward container after
+            // the "You have completed N <tier> Treasure Trails." chat message.
+            // (Barrows uses this container too, but via onWidgetLoaded — it never
+            // sets pendingClueTier, so there is no double emission.)
+            if (pendingClueTier != null
+                    && client.getTickCount() - pendingClueTick <= CLUE_PENDING_TIMEOUT_TICKS) {
+                emitChestLoot(pendingClueTier, event.getItemContainer());
+            }
+            pendingClueTier = null;
         }
     }
 
@@ -275,6 +331,133 @@ public class LootLoggerPlugin extends Plugin {
         payload.items = new ArrayList<>();
         event.getItems().forEach(item -> payload.items.add(enrichItem(item.getId(), item.getQuantity())));
         emit("NPC_LOOT", payload);
+    }
+
+    /**
+     * Interface-delivered rewards: read the reward ItemContainer when the chest
+     * interface loads (same interface/container pairs as the official loot tracker).
+     */
+    @Subscribe
+    public void onWidgetLoaded(WidgetLoaded event) {
+        final String source;
+        final ItemContainer container;
+
+        // gameval classes are fully qualified: the wildcard import of
+        // net.runelite.api.* brings in the legacy InventoryID enum (name clash).
+        switch (event.getGroupId()) {
+            case net.runelite.api.gameval.InterfaceID.BARROWS_REWARD:
+                source = "Barrows";
+                container = client.getItemContainer(net.runelite.api.gameval.InventoryID.TRAIL_REWARDINV);
+                break;
+            case net.runelite.api.gameval.InterfaceID.RAIDS_REWARDS:
+                if (chestLooted) return;
+                source = "Chambers of Xeric";
+                container = client.getItemContainer(net.runelite.api.gameval.InventoryID.RAIDS_REWARDS);
+                chestLooted = true;
+                break;
+            case net.runelite.api.gameval.InterfaceID.TOB_CHESTS:
+                if (chestLooted || !inTobChestRegion()) return;
+                source = "Theatre of Blood";
+                container = client.getItemContainer(net.runelite.api.gameval.InventoryID.TOB_CHESTS);
+                chestLooted = true;
+                break;
+            case net.runelite.api.gameval.InterfaceID.TOA_CHESTS:
+                if (chestLooted) return;
+                // TODO (deferred): raid level / team size / damage varbit metadata
+                source = "Tombs of Amascut";
+                container = client.getItemContainer(net.runelite.api.gameval.InventoryID.TOA_CHESTS);
+                chestLooted = true;
+                break;
+            default:
+                return;
+        }
+
+        emitChestLoot(source, container);
+    }
+
+    private boolean inTobChestRegion() {
+        // Instanced content: map the local position back to the template region.
+        Player localPlayer = client.getLocalPlayer();
+        if (localPlayer == null) return false;
+        int region = WorldPoint.fromLocalInstance(client, localPlayer.getLocalLocation()).getRegionID();
+        return region == THEATRE_OF_BLOOD_REGION;
+    }
+
+    /**
+     * Chat-triggered loot: clue casket tier locking, region-gated minigame loot
+     * markers, and the collection-log chat fallback.
+     */
+    @Subscribe
+    public void onChatMessage(ChatMessage event) {
+        ChatMessageType type = event.getType();
+        if (type != ChatMessageType.GAMEMESSAGE && type != ChatMessageType.SPAM
+                && type != ChatMessageType.MESBOX) {
+            return;
+        }
+
+        final String message = Text.removeTags(event.getMessage());
+
+        // Clue casket: the completion message names the tier; the loot arrives via
+        // the TRAIL_REWARDINV container change (handled in onItemContainerChanged).
+        final Matcher clue = CLUE_SCROLL_PATTERN.matcher(message);
+        if (clue.find()) {
+            String tier = clue.group(1);
+            pendingClueTier = "Clue Scroll (" + Character.toUpperCase(tier.charAt(0)) + tier.substring(1) + ")";
+            pendingClueTick = client.getTickCount();
+            return;
+        }
+
+        // Collection log chat fallback — only when the game setting routes the
+        // notification to chat (varbit == 1); popup mode is handled by
+        // onScriptPreFired, so the two paths never double-emit (mirrors Dink).
+        final Matcher clog = COLLECTION_LOG_CHAT_PATTERN.matcher(message);
+        if (clog.find()
+                && client.getVarbitValue(net.runelite.api.gameval.VarbitID.OPTION_COLLECTION_NEW_ITEM) == 1) {
+            emitCollectionLog(clog.group(1).trim());
+            return;
+        }
+
+        // Region-gated minigame loot ("You found some loot: …" has no reward
+        // container — the items appear directly in the inventory).
+        Player localPlayer = client.getLocalPlayer();
+        if (localPlayer == null) return;
+        final int regionId = localPlayer.getWorldLocation().getRegionID();
+
+        if (regionId == TEMPOROSS_REGION && message.startsWith(MINIGAME_LOOT_STRING)) {
+            emitChestLootMarker("Reward pool (Tempoross)");
+        } else if (regionId == GUARDIANS_OF_THE_RIFT_REGION && message.startsWith(MINIGAME_LOOT_STRING)) {
+            emitChestLootMarker("Guardians of the Rift");
+        } else if (regionId == WINTERTODT_REGION && message.contains(MINIGAME_LOOT_STRING)) {
+            // Region-gated, so crates opened outside Wintertodt are missed, and the
+            // crate cannot be told apart from the reward cart — both limitations
+            // shared with the official tracker.
+            emitChestLootMarker("Supply crate (Wintertodt)");
+        }
+    }
+
+    /**
+     * Collection log popup detection (Dink-verified mechanism): NOTIFICATION_START
+     * flags an incoming popup, NOTIFICATION_DELAY exposes its title/body VarcStrings.
+     * Immune to chat filters, unlike the chat-message fallback above.
+     */
+    @Subscribe
+    public void onScriptPreFired(ScriptPreFired event) {
+        int scriptId = event.getScriptId();
+        if (scriptId == ScriptID.NOTIFICATION_START) {
+            collectionPopupStarted = true;
+        } else if (scriptId == ScriptID.NOTIFICATION_DELAY) {
+            String title = client.getVarcStrValue(net.runelite.api.gameval.VarClientID.NOTIFICATION_TITLE);
+            if (collectionPopupStarted && "Collection log".equalsIgnoreCase(title)) {
+                String body = client.getVarcStrValue(net.runelite.api.gameval.VarClientID.NOTIFICATION_MAIN);
+                if (body != null) {
+                    String clean = Text.removeTags(body).trim();
+                    if (clean.startsWith(COLLECTION_POPUP_PREFIX)) {
+                        emitCollectionLog(clean.substring(COLLECTION_POPUP_PREFIX.length()).trim());
+                    }
+                }
+            }
+            collectionPopupStarted = false;
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -398,6 +581,55 @@ public class LootLoggerPlugin extends Plugin {
         BankSnapshotPayload payload = new BankSnapshotPayload();
         payload.items = items;
         emit("BANK_SNAPSHOT", payload);
+    }
+
+    /**
+     * Emits a CHEST_LOOT with the full contents of a reward container
+     * (Barrows/raid chests, clue caskets). Skips silently when the container
+     * is missing or empty.
+     */
+    private void emitChestLoot(String source, ItemContainer container) {
+        if (container == null) return;
+
+        List<RawItem> items = new ArrayList<>();
+        for (Item item : container.getItems()) {
+            if (item.getId() != -1 && item.getQuantity() > 0) {
+                items.add(enrichItem(item.getId(), item.getQuantity()));
+            }
+        }
+        if (items.isEmpty()) return;
+
+        ChestLootPayload payload = new ChestLootPayload();
+        payload.source = source;
+        payload.items = items;
+        emit("CHEST_LOOT", payload);
+    }
+
+    /**
+     * Emits an items-empty CHEST_LOOT marker: the server attributes the next
+     * few ticks of inventory gains (its existing net-diff) to {@code source}.
+     * Used for loot that goes straight to the inventory with no reward container
+     * (Wintertodt / Tempoross / GOTR "You found some loot:" messages).
+     */
+    private void emitChestLootMarker(String source) {
+        // KNOWN LIMITATION: any inventory gain that occurs between this loot
+        // message and the actual crate-open tick — for reasons unrelated to the
+        // crate — will be misattributed to this source. This is the same
+        // limitation the official loot tracker accepts; do not try to "fix" it.
+        ChestLootPayload payload = new ChestLootPayload();
+        payload.source = source;
+        payload.items = new ArrayList<>();
+        emit("CHEST_LOOT", payload);
+    }
+
+    /**
+     * Emits a COLLECTION_LOG event with the newly filled slot's item name.
+     */
+    private void emitCollectionLog(String itemName) {
+        if (itemName == null || itemName.isEmpty()) return;
+        CollectionLogPayload payload = new CollectionLogPayload();
+        payload.itemName = itemName;
+        emit("COLLECTION_LOG", payload);
     }
 
     /**
@@ -722,6 +954,24 @@ public class LootLoggerPlugin extends Plugin {
         public int id;
         public String name;
         public String state; // "NOT_STARTED" | "IN_PROGRESS" | "FINISHED"
+    }
+
+    /**
+     * Interface-delivered loot. items non-empty = the reward container contents;
+     * items EMPTY = a marker telling the server to attribute the next inventory
+     * gains (its net-diff) to {@code source}.
+     */
+    public static class ChestLootPayload {
+        public String source; // e.g. "Barrows", "Clue Scroll (Elite)", "Reward pool (Tempoross)"
+        public List<RawItem> items;
+    }
+
+    /**
+     * A new collection log slot was filled. Capture-only — no frontend consumes
+     * this yet.
+     */
+    public static class CollectionLogPayload {
+        public String itemName;
     }
 
     /**
