@@ -32,7 +32,7 @@ import java.util.*;
  * machine) has been moved to the Next.js backend. This plugin collects raw game
  * signals and ships them as typed RawEvent messages to /api/ingest via LootWriter.
  * <p>
- * Wire format — eight event types:
+ * Wire format — nine event types:
  * TICK           — per-tick context: HP, widget flags, autocast varp, quest-points,
  * last menu option + inv/equip snapshots (only on dirty ticks).
  * MENU_CLICK     — raw option + target string on every MenuOptionClicked.
@@ -41,7 +41,9 @@ import java.util.*;
  * SHOP_STOCK     — shop inventory when the shop widget first opens.
  * EXAMINE_TEXT   — raw widget-522 text when monster examine opens.
  * QUEST_STATE    — quest id/name/newState on every QuestState change.
- * STATS_SNAPSHOT — real skill levels + total/combat level on login and every 10 min.
+ * STATS_SNAPSHOT — real skill levels + total/combat level (+ membership) on login and every 10 min.
+ * BANK_SNAPSHOT  — full bank contents whenever the bank container changes while open.
+ * QUEST_SNAPSHOT — full quest-state list + quest points once per login (after quest varps settle).
  */
 @Slf4j
 @PluginDescriptor(name = "Loot to JSON")
@@ -84,7 +86,7 @@ public class LootLoggerPlugin extends Plugin {
     private boolean equipDirty = false;
 
     // --- WIDGET EDGE TRACKING ---
-    private boolean prevShopOpen = false;
+    private boolean shopCaptured = false; // one SHOP_STOCK per shop visit
     private boolean prevExamineOpen = false;
 
     // -------------------------------------------------------------------------
@@ -101,7 +103,7 @@ public class LootLoggerPlugin extends Plugin {
         // Force a full snapshot on the very first post-login tick.
         invDirty = true;
         equipDirty = true;
-        prevShopOpen = false;
+        shopCaptured = false;
         prevExamineOpen = false;
 
         if (client.getGameState() == GameState.LOGGED_IN) {
@@ -158,7 +160,7 @@ public class LootLoggerPlugin extends Plugin {
             // Force snapshots so the server can calibrate its state on login.
             invDirty = true;
             equipDirty = true;
-            prevShopOpen = false;
+            shopCaptured = false;
             prevExamineOpen = false;
             emitStatsSnapshot();
         }
@@ -175,6 +177,10 @@ public class LootLoggerPlugin extends Plugin {
             invDirty = true;
         } else if (id == InventoryID.EQUIPMENT.getId()) {
             equipDirty = true;
+        } else if (id == InventoryID.BANK.getId()) {
+            // The BANK container populates/changes only while the bank is open —
+            // the reliable point to capture a full snapshot.
+            emitBankSnapshot();
         }
     }
 
@@ -291,7 +297,13 @@ public class LootLoggerPlugin extends Plugin {
     private void checkQuestProgress() {
         if (questSyncTicks > 0) {
             questSyncTicks--;
-            if (questSyncTicks == 0) seedQuestMap();
+            if (questSyncTicks == 0) {
+                seedQuestMap();
+                // Quest varps have settled — capture the authoritative baseline.
+                // This is what surfaces pre-plugin completions (and progress made
+                // on mobile) without waiting for a state *transition*.
+                emitQuestSnapshot();
+            }
             return;
         }
 
@@ -310,18 +322,36 @@ public class LootLoggerPlugin extends Plugin {
     }
 
     /**
-     * Emits SHOP_STOCK on the tick the shop widget first becomes visible.
-     * Client-side edge detection is necessary here because only the client
-     * can read the shop's item grid widget.
+     * Emits SHOP_STOCK once per shop visit. Unlike a widget-open edge, this
+     * retries every tick until the item grid has populated (the interface
+     * loads over several ticks), then resolves the shop title client-side.
+     * If the title genuinely cannot be found, no SHOP_STOCK is emitted —
+     * falling back to the NPC menu target would record "Shop keeper" /
+     * "Shop assistant" instead of the shop's real name.
      */
     private void handleShopEdge(boolean shopOpen) {
-        if (shopOpen && !prevShopOpen) {
-            ShopStockPayload payload = new ShopStockPayload();
-            payload.shopNameCandidates = getShopNameCandidates();
-            payload.items = getShopItems();
-            emit("SHOP_STOCK", payload);
+        if (!shopOpen) {
+            shopCaptured = false;
+            return;
         }
-        prevShopOpen = shopOpen;
+        if (shopCaptured) return;
+
+        List<RawItem> items = getShopItems();
+        if (items.isEmpty()) return; // interface still loading — retry next tick
+
+        String shopName = getActiveShopName();
+        if (shopName == null) {
+            log.info("[LL] Shop name not found. Widget 300 children dump: {}", dumpWidget300());
+            shopCaptured = true; // skip this visit; dump once, no NPC-name fallback
+            return;
+        }
+
+        ShopStockPayload payload = new ShopStockPayload();
+        payload.shopNameCandidates = new ArrayList<>();
+        payload.shopNameCandidates.add(shopName);
+        payload.items = items;
+        emit("SHOP_STOCK", payload);
+        shopCaptured = true;
     }
 
     /**
@@ -354,7 +384,25 @@ public class LootLoggerPlugin extends Plugin {
     }
 
     /**
-     * Emits a STATS_SNAPSHOT with real (unboosted) levels for every skill.
+     * Emits a full BANK_SNAPSHOT of the bank container (placeholders with qty 0
+     * excluded). The server stores it and the frontend's get_bank_snapshot RPC
+     * reads the most recent one, so emitting on each bank change is harmless.
+     */
+    private void emitBankSnapshot() {
+        List<RawItem> items = new ArrayList<>();
+        for (RawItem item : snapshotContainer(InventoryID.BANK)) {
+            if (item.getQty() > 0) items.add(item);
+        }
+        if (items.isEmpty()) return;
+
+        BankSnapshotPayload payload = new BankSnapshotPayload();
+        payload.items = items;
+        emit("BANK_SNAPSHOT", payload);
+    }
+
+    /**
+     * Emits a STATS_SNAPSHOT with real (unboosted) levels for every skill,
+     * plus membership signals (days remaining varp + members-world flag).
      * Must run on the client thread.
      */
     private void emitStatsSnapshot() {
@@ -370,7 +418,30 @@ public class LootLoggerPlugin extends Plugin {
         payload.setSkillLevels(skillLevels);
         payload.setTotalLevel(client.getTotalLevel());
         payload.setCombatLevel(localPlayer.getCombatLevel());
+        payload.setMembershipDays(client.getVarpValue(VarPlayer.MEMBERSHIP_DAYS));
+        payload.setMemberWorld(client.getWorldType().contains(WorldType.MEMBERS));
         emit("STATS_SNAPSHOT", payload);
+    }
+
+    /**
+     * Emits a QUEST_SNAPSHOT: the full quest→state map (as seeded from the
+     * client) plus current quest points. Fired once per login after the
+     * 3-tick quest-varp settle, so the server always has an authoritative
+     * baseline — QUEST_STATE events then record deltas on top of it.
+     */
+    private void emitQuestSnapshot() {
+        QuestSnapshotPayload payload = new QuestSnapshotPayload();
+        payload.quests = new ArrayList<>();
+        for (Map.Entry<Quest, QuestState> e : questStates.entrySet()) {
+            if (e.getValue() == null) continue;
+            QuestEntry entry = new QuestEntry();
+            entry.id = e.getKey().getId();
+            entry.name = e.getKey().getName();
+            entry.state = e.getValue().name();
+            payload.quests.add(entry);
+        }
+        payload.questPoints = client.getVarpValue(VarPlayer.QUEST_POINTS);
+        emit("QUEST_SNAPSHOT", payload);
     }
 
     /**
@@ -437,20 +508,61 @@ public class LootLoggerPlugin extends Plugin {
     }
 
     /**
-     * Reads the raw text candidates from the shop title widgets (300, {1,2,78}).
-     * Server applies the name-resolution logic (fallback to last locked shop target).
+     * Resolves the shop's display title from widget 300 children {1, 2, 78}:
+     * the widget's own text first, then each of its children's texts. Returns
+     * null when no valid title is present (caller logs a diagnostic dump and
+     * skips the snapshot rather than corrupting data with an NPC name).
      */
-    private List<String> getShopNameCandidates() {
-        List<String> candidates = new ArrayList<>();
-        int[] slots = {1, 2, 78};
-        for (int slot : slots) {
-            Widget w = client.getWidget(300, slot);
+    private String getActiveShopName() {
+        int[] primaryLocations = {1, 2, 78};
+        for (int id : primaryLocations) {
+            Widget w = client.getWidget(300, id);
             if (w != null && w.getText() != null && !w.getText().isEmpty()) {
                 String clean = Text.removeTags(w.getText()).trim();
-                if (!clean.isEmpty()) candidates.add(clean);
+                if (clean.length() > 3 && !clean.equalsIgnoreCase("Close") && !clean.contains("Value check")) {
+                    return clean;
+                }
+            }
+            if (w != null && w.getChildren() != null) {
+                for (Widget child : w.getChildren()) {
+                    if (child != null && child.getText() != null && !child.getText().isEmpty()) {
+                        String clean = Text.removeTags(child.getText()).trim();
+                        if (clean.length() > 3 && !clean.equalsIgnoreCase("Close") && !clean.contains("Value check")) {
+                            return clean;
+                        }
+                    }
+                }
             }
         }
-        return candidates;
+        return null;
+    }
+
+    /**
+     * Diagnostic: every non-null child of interface 300 that carries any text,
+     * as "[id, text='…']" pairs (child texts as "[id/childIdx, text='…']"),
+     * so the correct title widget can be identified from the log.
+     */
+    private String dumpWidget300() {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < 100; i++) {
+            Widget w = client.getWidget(300, i);
+            if (w == null) continue;
+            if (w.getText() != null && !w.getText().trim().isEmpty()) {
+                sb.append("[").append(i).append(", text='")
+                        .append(Text.removeTags(w.getText()).trim()).append("'] ");
+            }
+            Widget[] children = w.getChildren();
+            if (children != null) {
+                for (int c = 0; c < children.length; c++) {
+                    Widget child = children[c];
+                    if (child != null && child.getText() != null && !child.getText().trim().isEmpty()) {
+                        sb.append("[").append(i).append("/").append(c).append(", text='")
+                                .append(Text.removeTags(child.getText()).trim()).append("'] ");
+                    }
+                }
+            }
+        }
+        return sb.length() == 0 ? "(no text found in any child)" : sb.toString().trim();
     }
 
     /**
@@ -592,5 +704,32 @@ public class LootLoggerPlugin extends Plugin {
         private Map<String, Integer> skillLevels; // skill name → real (unboosted) level
         private int totalLevel;
         private int combatLevel;
+        private int membershipDays;   // VarPlayer.MEMBERSHIP_DAYS — >0 means currently a member
+        private boolean memberWorld;  // logged into a members world — also implies current membership
+    }
+
+    /**
+     * Emitted once per login after the quest varps settle. The authoritative
+     * baseline of every quest's state + total quest points; QUEST_STATE
+     * events record transitions on top of this.
+     */
+    public static class QuestSnapshotPayload {
+        public List<QuestEntry> quests;
+        public int questPoints;
+    }
+
+    public static class QuestEntry {
+        public int id;
+        public String name;
+        public String state; // "NOT_STARTED" | "IN_PROGRESS" | "FINISHED"
+    }
+
+    /**
+     * Emitted whenever the bank container changes while open. Full contents
+     * snapshot (qty-0 placeholders excluded). Server stores it; the frontend
+     * reads the most recent one via get_bank_snapshot.
+     */
+    public static class BankSnapshotPayload {
+        public List<RawItem> items;
     }
 }
